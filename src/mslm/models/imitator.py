@@ -15,7 +15,8 @@ class Imitator(nn.Module):
         max_seq_length: int = 301,
         encoder_dropout: int = 0.4,
         cross_attention_dropout: int = 0.4,
-        pe_dropout: int = 0.2
+        pe_dropout: int = 0.2,
+        pool_dim: int = 256
     ):
         super().__init__()
 
@@ -29,7 +30,8 @@ class Imitator(nn.Module):
             "max_seq_length": max_seq_length,
             "encoder_dropout": encoder_dropout,
             "cross_attention_dropout": cross_attention_dropout,
-            "pe_dropout": pe_dropout
+            "pe_dropout": pe_dropout,
+            "pool_dim": pool_dim,
         }
 
         print("Model Parameters: ", self.cfg)
@@ -45,7 +47,6 @@ class Imitator(nn.Module):
             nn.LayerNorm(hidden_size // 2)
         )
 
-        pool_dim = 256
         # linear sequencer
         self.conv1  = nn.Conv1d(hidden_size//2, pool_dim, kernel_size=3, padding=1)
         self.ln1    = nn.LayerNorm(pool_dim)

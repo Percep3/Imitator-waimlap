@@ -6,13 +6,13 @@ import pandas as pd
 from pre_calculate import LLM
 from keypoints import KeypointProcessing
 
-main_directory = "/home/giorgio6846/Code/Sign-AI"
+main_directory = "/mnt/data"
 
 PROCESS = {
     "keypoints": False,
     "labels": False,
     "embeddings": True,
-    "ids": True,
+    "ids": False,
 }
 
 def save_keypoints(hdf5Group, videoFolderPath):
@@ -118,13 +118,16 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_filename", type=Path, help="Main directory of the project.")
     args = parser.parse_args()
 
-    dataPath = os.path.join(main_directory, "data")
+    dataPath = os.path.join(main_directory)#, "data")
     keypoint_tool = KeypointProcessing()
     llm = LLM(main_directory)
-    f = h5py.File(os.path.join(dataPath, "processed", args.dataset_filename), 'r+')
+    f = h5py.File(os.path.join(dataPath, "processed_oldver", args.dataset_filename), 'r+')
 
-    videosPath = os.path.join(main_directory, "data", "raw")
-    
+    videosPath = os.path.join(main_directory, "videos")#, "data", "raw")
+
+    print(dataPath)
+    print(videosPath)
+
     if PROCESS["embeddings"]:
         llm.load_model()
     

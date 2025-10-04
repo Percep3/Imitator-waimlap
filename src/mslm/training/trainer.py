@@ -23,14 +23,14 @@ from datetime import datetime
 
 class Trainer:
     def __init__(self, model, train_loader, val_loader, learning_rate, save_tb_model=True, **kwargs):
-        dynamo_plugin = TorchDynamoPlugin(
-            backend="inductor",  # Options: "inductor", "aot_eager", "aot_nvfuser", etc.
-            mode="default",      # Options: "default", "reduce-overhead", "max-autotune"
-            dynamic=True
-        )
+        #dynamo_plugin = TorchDynamoPlugin(
+        #    backend="inductor",  # Options: "inductor", "aot_eager", "aot_nvfuser", etc.
+        #    mode="default",      # Options: "default", "reduce-overhead", "max-autotune"
+        #    dynamic=True
+        #)
 
         #Accelerator module
-        self.accelerator = Accelerator(mixed_precision="bf16", dynamo_plugin=dynamo_plugin)
+        self.accelerator = Accelerator(mixed_precision="bf16")#, dynamo_plugin=dynamo_plugin)
         self.device = self.accelerator.device
 
         #Hyperparameters

@@ -35,36 +35,41 @@ def lr_objetive(trial, train_dataloader, val_dataloader, **params):
 def complete_objective(trial, train_dataloader, val_dataloader, model_params, train_config):
     adjacency_matrix = np.load(path_vars.A_matrix, allow_pickle=True)
 
-    hidden_size   = trial.suggest_int("hidden_size", 1024, 2048, step=256)
-    nhead         = trial.suggest_categorical("nhead", [8, 16, 32])
+    encoder_hidden_size   = trial.suggest_int("encoder_hidden_size", 256, 1024, step=256)
+    decoder_hidden_size   = trial.suggest_int("decoder_hidden_size", 512, 1024, step=256)
+    nhead         = trial.suggest_categorical("nhead", [2, 4, 8])
     ff_dim        = trial.suggest_int("ff_dim", 1024, 3072, step=256)
-    n_layers      = trial.suggest_categorical("n_layers", [8, 10, 12])
+
     learning_rate = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
+    n_encoder_layers        = trial.suggest_int("n_encoder_layers", 2, 8, step=2)
+    n_decoder_layers        = trial.suggest_int("n_decoder_layers", 2, 8, step=2)
     encoder_dropout = trial.suggest_float("encoder_dropout", 0.1, 0.6, step=0.05)
-    multihead_dropout = trial.suggest_float("multihead_dropout", 0.1, 0.6, step=0.05)
-    pool_dim      = trial.suggest_categorical("pool_dim", [128, 256, 512])
+    decoder_dropout = trial.suggest_float("decoder_dropout", 0.1, 0.6, step=0.05)
+
     weight_decay  = trial.suggest_float("weight_decay", 0.0, 0.1, step=0.01)
     grad_clip    = trial.suggest_float("grad_clip", 0.1, 5.0, step=0.1)
 
-    print(f"Hidden Size: {hidden_size}, Nhead: {nhead}, FF Dim: {ff_dim}, N Layers: {n_layers}, Learning Rate: {learning_rate}")
-    print(f"Encoder Dropout: {encoder_dropout}, Multihead Dropout: {multihead_dropout}")
+    print(f"Encoder Hidden Size: {encoder_hidden_size}, Decoder Hidden Size: {decoder_hidden_size}, Nhead: {nhead}, FF Dim: {ff_dim}, Encoder Layers: {n_encoder_layers}, Decoder Layers: {n_decoder_layers}, Learning Rate: {learning_rate}")
+    print(f"Encoder Dropout: {encoder_dropout}, Decoder Dropout: {decoder_dropout}")
     train_config["learning_rate"] = learning_rate
     train_config["grad_clip"] = grad_clip
 
-    early_stopping = EarlyStopping(patience=5)
+    early_stopping = EarlyStopping(patience=10)
+    trainer.early_stopping = early_stopping
 
     model = Imitator(
         A = adjacency_matrix,
         input_size=model_params["input_size"],
         output_size=model_params["output_size"],
-        hidden_size=hidden_size,
+        encoder_hidden_size = encoder_hidden_size, 
+        decoder_hidden_size = decoder_hidden_size,
         nhead=nhead,
         ff_dim=ff_dim,
-        n_layers=n_layers,
-        max_seq_length=301,
-        pool_dim=pool_dim,
-        encoder_dropout=encoder_dropout,
-        multihead_dropout=multihead_dropout,
+        n_encoder_layers = n_encoder_layers,
+        n_decoder_layers = n_decoder_layers,
+        max_seq_length=20,
+        encoder_dropout = encoder_dropout, 
+        decoder_dropout = decoder_dropout
     )
 
     trainer = Trainer(model, train_dataloader, val_dataloader,save_tb_model=False , **train_config)

@@ -68,6 +68,8 @@ class KeypointDataset(Dataset):
                 for clip in clip_ids:
                     try:
                         shape = f[dataset]["keypoints"][clip].shape[0]
+
+                        print(f[dataset]["embeddings"][clip].shape)
                         if shape < self.max_length:
                             self.valid_index.append((dataset, clip))
                             self.video_lengths.append(shape)

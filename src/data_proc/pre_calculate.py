@@ -2,7 +2,8 @@ import torch
 import gc
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
-MODEL_ID = "unsloth/gemma-3n-E2B-it-unsloth-bnb-4bit"
+#MODEL_ID = "unsloth/gemma-3n-E2B-it-unsloth-bnb-4bit"
+MODEL_ID = "unsloth/Llama-3.2-3B"
 
 
 class LLM:
@@ -31,6 +32,7 @@ class LLM:
             break
 
     def run(self, label):
+        print(label)
         input_ids = self.tokenizer(label, return_tensors="pt").input_ids.to('cuda')
         self.embeddings = self.embeddings.to('cuda')
         t = self.embeddings(input_ids[0])
