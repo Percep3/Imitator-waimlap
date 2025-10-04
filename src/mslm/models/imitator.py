@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
-from .components import PositionalEncoding
-from torch.utils.checkpoint import checkpoint
+from .components import TransformerEncoderLayerRoPE
+import torch.utils.checkpoint as checkpoint
 
 class Imitator(nn.Module):
     def __init__(
         self,
-        input_size: int = 133*2,
+        input_size: int = 250*2,
         hidden_size: int = 512,
         output_size: int = 3072,
         nhead: int = 8,
@@ -15,11 +15,10 @@ class Imitator(nn.Module):
         max_seq_length: int = 301,
         encoder_dropout: int = 0.4,
         cross_attention_dropout: int = 0.4,
-        pe_dropout: int = 0.2,
         pool_dim: int = 256
     ):
         super().__init__()
-
+        
         self.cfg = {
             "input_size": input_size,
             "hidden_size": hidden_size,
@@ -30,11 +29,8 @@ class Imitator(nn.Module):
             "max_seq_length": max_seq_length,
             "encoder_dropout": encoder_dropout,
             "cross_attention_dropout": cross_attention_dropout,
-            "pe_dropout": pe_dropout,
-            "pool_dim": pool_dim,
+            "pool_dim": pool_dim
         }
-
-        print("Model Parameters: ", self.cfg)
 
         # --- Bloque de entrada ---
 
@@ -59,8 +55,7 @@ class Imitator(nn.Module):
         self.linear_hidden = nn.Linear(pool_dim, hidden_size)
 
         # Positional Encoding + Transformer
-        self.pe          = PositionalEncoding(hidden_size, dropout=pe_dropout)
-        encoder_layer    = nn.TransformerEncoderLayer(
+        encoder_layer    = TransformerEncoderLayerRoPE(
             d_model=hidden_size,
             nhead=nhead,
             dim_feedforward=ff_dim,
@@ -91,11 +86,15 @@ class Imitator(nn.Module):
             nn.Linear(output_size * 2, output_size)
         )
 
+    @torch.compile(dynamic=True)
     def forward(self, x:torch.Tensor, frames_padding_mask:torch.Tensor=None) -> torch.Tensor:
         """
         x: Tensor of frames
         returns: Tensor of embeddings for each token (128 tokens of frames)
         """
+
+        def transformer_block(x):
+            return self.transformer(x,src_key_padding_mask=frames_padding_mask)
 
         B, T, D, K = x.shape                # x -> [batch_size, T, input_size]
         x = x.view(B, T,  D * K)            # [B, T, input_size]
@@ -110,21 +109,29 @@ class Imitator(nn.Module):
         x = self.act1(x)                    # [B, pool_dim, hidden//2]
         x = x.transpose(1, 2)               # [B, hidden//2, pool_dim]
 
-        x = self.conv2(x)                  # [B, hidden//2, pool_dim]
-        x = x.transpose(1, 2)               # [B, pool_dim, hidden//2]
-        x = self.ln2(x)                     # [B, pool_dim, hidden//2]
-        x = self.act2(x)                    # [B, pool_dim, hidden//2]
+        x = self.conv2(x)                  # [B, pool_dim, pool_dim]
+        x = x.transpose(1, 2)               # [B, pool_dim, pool_dim]
+        x = self.ln2(x)                     # [B, pool_dim, pool_dim]
+        x = self.act2(x)                    # [B, pool_dim, pool_dim]
 
         x = self.linear_hidden(x)           # [B, pool_dim, hidden]
 
-        x = self.pe(x)
-        x = self.transformer(x, src_key_padding_mask=frames_padding_mask)  # [B, pool_dim, hidden]
+        if self.training:
+            x = checkpoint.checkpoint(
+                transformer_block, 
+                x,
+                use_reentrant=True
+            )                               # [B, pool_dim, hidden]
+        else:
+            x = self.transformer(x, src_key_padding_mask=frames_padding_mask)
 
-        M = self.proj(x)     # [B, pool_dim, output_size]
-        # M = M.masked_fill(frames_padding_mask.unsqueeze(-1), 0.0)
+        M = self.proj(x).contiguous()        # [B, pool_dim, output_size]
         
-        Q = self.token_queries.unsqueeze(0).expand(B, -1, -1)   # [B, n_tokens, output_size]
-    
+        Q = self.token_queries.unsqueeze(0).expand(B, -1, -1).contiguous()   # [B, n_tokens, output_size]
+        
+        if frames_padding_mask is not None:
+            frames_padding_mask = frames_padding_mask.contiguous()
+
         attn_out, attn_w = self.cross_attn(
             query=Q,
             key=M,
@@ -133,5 +140,5 @@ class Imitator(nn.Module):
         )  # [B, n_tokens, output_size]
         x = self.norm_attn(Q + attn_out)
         # print(f"Attention output shape: {attn_out.shape}, Q shape: {Q.shape}, M shape: {M.shape}")
-        #x = x + stochastic_depth(self.proj_final(attn_out), p=0.2, mode="row")        # [B, n_tokens, output_size]
+        x = x + self.proj_final(attn_out)        # [B, n_tokens, output_size]
         return x
