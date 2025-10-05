@@ -6,3 +6,4 @@ Version94 = Disabled Data Augmentation due to no changes in val or train loss
 Version95 = Study for best hyperparameters for the model
 Version100 = New hyperparameters with new dataset from HuggingFace Transformers GGUF
 Version102 = New loss Function
+Version110 = WAImLAB

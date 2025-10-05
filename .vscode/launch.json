@@ -8,13 +8,13 @@
             "name": "Debug Poe Train (Conda)",
             "type": "debugpy",
             "request": "launch",
-            "program": "/home/giorgio6846/miniconda3/envs/Sign/bin/poe",
+            "program": "/home/giorgio6846/miniconda3/envs/SignAI/bin/poe",
             "args": ["train"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {
-                "CONDA_DEFAULT_ENV": "Sign",
-                "PATH": "/home/giorgio6846/miniconda3/envs/Sign/bin:${env:PATH}"
+                "CONDA_DEFAULT_ENV": "SignAI",
+                "PATH": "/home/giorgio6846/miniconda3/envs/SignAI/bin:${env:PATH}"
             }
         },
         {
@@ -27,7 +27,7 @@
             "cwd": "${workspaceFolder}",
             "env": {
                 "CONDA_DEFAULT_ENV": "Sign",
-                "PATH": "/home/giorgio6846/miniconda3/envs/Sign/bin:${env:PATH}",
+                "PATH": "/home/giorgio6846/miniconda3/envs/SignAI/bin:${env:PATH}",
                 "DDP_ADDR": "172.25.197.59",
                 "DDP_PORT": "50050",
                 "GRPC_ADDR": "172.25.197.59",

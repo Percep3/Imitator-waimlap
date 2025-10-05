@@ -6,7 +6,7 @@ import torch.utils.checkpoint as checkpoint
 class Imitator(nn.Module):
     def __init__(
         self,
-        input_size: int = 250*2,
+        input_size: int = 111*2,
         hidden_size: int = 512,
         output_size: int = 3072,
         nhead: int = 8,

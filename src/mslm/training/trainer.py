@@ -23,14 +23,14 @@ from datetime import datetime
 
 class Trainer:
     def __init__(self, model, train_loader, val_loader, learning_rate, save_tb_model=True, **kwargs):
-        #dynamo_plugin = TorchDynamoPlugin(
-        #    backend="inductor",  # Options: "inductor", "aot_eager", "aot_nvfuser", etc.
-        #    mode="default",      # Options: "default", "reduce-overhead", "max-autotune"
-        #    dynamic=True
-        #)
+        dynamo_plugin = TorchDynamoPlugin(
+            backend="inductor",  # Options: "inductor", "aot_eager", "aot_nvfuser", etc.
+            mode="default",      # Options: "default", "reduce-overhead", "max-autotune"
+            dynamic=True
+        )
 
         #Accelerator module
-        self.accelerator = Accelerator(mixed_precision="bf16")#, dynamo_plugin=dynamo_plugin)
+        self.accelerator = Accelerator(mixed_precision="bf16", dynamo_plugin=dynamo_plugin)
         self.device = self.accelerator.device
 
         #Hyperparameters
@@ -254,7 +254,7 @@ class Trainer:
 
     def _forward_loss(self, keypoint, frames_padding_mask, embedding, mask_embedding):
         with self.accelerator.autocast():
-            output, _ = self.model(keypoint, frames_padding_mask)
+            output = self.model(keypoint, frames_padding_mask)
             loss, mse, cossim = self.criterion(output, embedding, mask_embedding)            
         return loss, mse, cossim
 
@@ -266,6 +266,7 @@ class Trainer:
         batch_size = keypoint.size(0)
         start = 0
         end = keypoint.size(0)
+
         if self.batch_sampling:
             n_sub_batch = (batch_size + self.sub_batch - 1) // self.sub_batch
 
@@ -275,22 +276,22 @@ class Trainer:
                     if self.batch_sampling:
                         start = i * self.sub_batch
                         end = min(start + self.sub_batch, batch_size)
-                        with nvtx.annotate("Forward Pass", color="blue"):
-                            loss, mse, cossim = self._forward_loss(keypoint[start:end], 
-                                                        frames_padding_mask[start:end], 
-                                                        embedding[start:end], 
-                                                        mask_embedding[start:end])
-                        if self.batch_sampling:
-                            loss /= n_sub_batch
-                            mse /= n_sub_batch
-                            cossim /= n_sub_batch
+                    with nvtx.annotate("Forward Pass", color="blue"):
+                        loss, mse, cossim = self._forward_loss(keypoint[start:end], 
+                                                    frames_padding_mask[start:end], 
+                                                    embedding[start:end], 
+                                                    mask_embedding[start:end])
+                    if self.batch_sampling:
+                        loss /= n_sub_batch
+                        mse /= n_sub_batch
+                        cossim /= n_sub_batch
 
-                        with nvtx.annotate("Backward Pass", color="blue"):
-                            torch.autograd.set_detect_anomaly(True)
-                            self.accelerator.backward(loss)
-                        batch_loss += loss.detach()
-                        batch_mse += mse.detach()
-                        batch_cossim += cossim.detach()
+                    with nvtx.annotate("Backward Pass", color="blue"):
+                        torch.autograd.set_detect_anomaly(True)
+                        self.accelerator.backward(loss)
+                    batch_loss += loss.detach()
+                    batch_mse += mse.detach()
+                    batch_cossim += cossim.detach()
 
             with nvtx.annotate("Step", color="blue"):
                 self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)

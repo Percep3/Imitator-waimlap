@@ -1,4 +1,4 @@
-model_version = 42
+model_version = 110
 checkpoint = 1
 learning_rate= 0.0007224419966873763
 epochs= 10
