@@ -32,8 +32,8 @@ class LLM:
             break
 
     def run(self, label):
-        print(label)
-        input_ids = self.tokenizer(label, return_tensors="pt").input_ids.to('cuda')
+        input_ids = self.tokenizer(label + '<pad>', return_tensors="pt").input_ids.to('cuda')
         self.embeddings = self.embeddings.to('cuda')
         t = self.embeddings(input_ids[0])
         return t
+
