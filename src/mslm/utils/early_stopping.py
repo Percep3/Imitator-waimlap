@@ -11,7 +11,7 @@ class EarlyStopping:
 
     def __call__(self, val_loss):
         if np.isnan(val_loss):
-            if self.verbose: print("Giorgio desgraciado \nIgnorando epoch")
+            if self.verbose: print("Giorgio desgraciado *Christian desgraciado \nIgnorando epoch")
             return
         
         if val_loss < self.best_loss - self.treshold:
