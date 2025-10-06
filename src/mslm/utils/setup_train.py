@@ -12,7 +12,7 @@ import numpy as np
 #Imported Classes
 from src.mslm.models import Imitator
 from src.mslm.training import Trainer
-from src.mslm.dataloader import KeypointDataset, collate_fn, GRPCDataset, BatchSampler
+from src.mslm.dataloader import KeypointDataset, collate_fn, BatchSampler
 from src.mslm.utils.paths import path_vars
 
 #Profilers
@@ -36,48 +36,29 @@ def prepare_datasets(h5File, train_ratio, n_keypoints=111):
 
 def create_dataloaders(train_dataset, validation_dataset, batch_size, num_workers=4, use_grpc=False, grpc_address=None, rank = 4, world_size = 4):
     """Crea y retorna los DataLoaders para entrenamiento y validación."""
-    if use_grpc:
-        gtrain_dataset = GRPCDataset(grpc_address, rank, world_size, split="train")
-        gval_dataset = GRPCDataset(grpc_address, rank, world_size, split="val")
-        
-        batch_per_worker = int(batch_size/world_size)
+    train_sampler = BatchSampler(train_dataset, batch_size)
+    val_sampler   = BatchSampler(validation_dataset, batch_size)
 
-        train_dataloader = DataLoader(gtrain_dataset,
-        batch_size=batch_per_worker,           
-        num_workers=4,           
-        pin_memory=True)
-
-        val_dataloader = DataLoader(gval_dataset,
-        batch_size=batch_per_worker,           
-        num_workers=4,           
-        pin_memory=True)
-
-    else:
-        train_sampler = BatchSampler(train_dataset, batch_size)
-        val_sampler   = BatchSampler(validation_dataset, batch_size)
-
-        train_dataloader = DataLoader(
-            train_dataset,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True,
-            collate_fn=collate_fn,
-            batch_sampler=train_sampler
-        )
-        val_dataloader = DataLoader(
-            validation_dataset,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True,
-            collate_fn=collate_fn,
-            batch_sampler=val_sampler
-        )
+    train_dataloader = DataLoader(
+        train_dataset,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        collate_fn=collate_fn,
+        batch_sampler=train_sampler
+    )
+    val_dataloader = DataLoader(
+        validation_dataset,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        collate_fn=collate_fn,
+        batch_sampler=val_sampler
+    )
     return train_dataloader, val_dataloader
 
 def build_model(input_size, output_size, **kwargs):
     """Construye, compila y retorna el modelo Imitator."""
-    #adjacency_matrix = np.load(path_vars.A_matrix, allow_pickle=True)
-
     model = Imitator(input_size=input_size, output_size=output_size, **kwargs)
     print(model)
     print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f} M parameters")
@@ -116,7 +97,6 @@ def check_checkpoint(model, params):
 
     if saved_arch != current_arch:
         raise ValueError("La arquitectura del modelo no coincide con la guardada.")
-    
     return True
 
 def run_training(params, train_dataloader, val_dataloader, model):
@@ -164,12 +144,3 @@ def profile_training(params, train_dataloader, val_dataloader, model, profile_mo
             p.export_memory_profile(f"{file_path}_memory.txt")
     else:
         raise ValueError("Unsupported profiling mode. Use 'nvidia' or 'pytorch'.")
-
-    def run_dt_training(params, train_dataloader, val_dataloader, model, rank, channel, dist, stub):
-        """Configura y ejecuta el entrenamiento."""
-        trainer = Trainer(model, train_dataloader, val_dataloader,save_tb_model=False, **params)
-        trainer.ckpt_mgr.save_params(params)
-        trainer.ckpt_mgr.save_model_architecture(model)
-
-        print("Starting training...")
-        return trainer.train_dist(rank, channel, dist, stub)

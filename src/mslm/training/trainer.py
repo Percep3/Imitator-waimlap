@@ -1,5 +1,4 @@
 from tqdm import tqdm
-import os
 import typing as t
 
 from accelerate import Accelerator
@@ -99,7 +98,6 @@ class Trainer:
 
         #Options 
         self.prof = False
-        self.distributed = None
         
         self.grad_clip = kwargs.get("grad_clip", 0.1)
         self.weight_decay = kwargs.get("weight_decay", 0.05)
@@ -116,7 +114,7 @@ class Trainer:
             self.train_loader, self.val_loader
         )
     @nvtx.annotate("Training Section", color="green")
-    def train(self, prof = False, load=False):
+    def train(self, prof = False):
         """Entrena el modelo Imitator.
         returns:
             train_loss: float, loss de entrenamiento
@@ -174,63 +172,6 @@ class Trainer:
 
         return train_loss, val_loss
 
-    @nvtx.annotate("Distributed Training Section", color="green")
-    def train_dist(self, rank, dist, stub):
-        from src.mslm.distributed import data_pb2, data_pb2_grpc
-        import io
-
-        """Entrena el modelo Imitator distribuido.
-        returns:
-            train_loss: float, loss de entrenamiento
-            val_loss: float, loss de validación
-        """
-        self.distributed = dist
-        def save_model_dist():
-                buf = io.BytesIO()
-                torch.save(self.model, buf)
-                req = data_pb2.SaveModelRequest(
-                    model_bytes=buf.getvalue(),
-                    model_name = f"{epoch}"
-                )
-                resp = stub.SaveModel(req)
-                print("=== SAVE MODEL ===")
-                print(" success:", resp.success)
-                print(" message:", resp.message)
-
-        print("LR:", self.learning_rate)
-        self.optimizer = AdamW(
-            self.model.parameters(), 
-            lr=self.learning_rate, 
-            weight_decay=1e-4,
-            foreach=True
-        )
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=2,
-            min_lr=1e-7
-        )
-        self.prepare_trainer()
-
-        for epoch in tqdm(range(self.epochs), desc="Entrenando", colour="green"):
-            train_loss = self._train_epoch(epoch)
-            if rank == 0:
-                if epoch == 1:
-                    save_model_dist()
-                elif (epoch % self.checkpoint_interval == 0 and epoch != 0) or (epoch == self.epochs - 1):
-                    save_model_dist()
-
-            val_loss = self.accelerator.gather(torch.tensor(val_loss, device=self.device.type)).mean().item()
-            self.scheduler.step(val_loss)
-            if self.early_stopping.stop and rank == 0:
-                save_model_dist()
-
-            if epoch % self.log_interval == 0:
-                tqdm.write(f"\nEpoch: {epoch}.\t Total loss: {train_loss/len(self.train_loader)}")
-
-        return train_loss, val_loss
-
     @nvtx.annotate("Train: Train Epoch", color="green")
     def _train_epoch(self, epoch):
         self.model.train()
@@ -251,13 +192,6 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)        
                 train_loss, metrics = self._train_batch(keypoint, frames_padding_mask, embedding, mask_embedding)
 
-            if self.distributed is not None:
-                loss_tensor = loss.to(self.device)
-                self.distributed.all_reduce(loss_tensor, op=self.distributed.ReduceOp.SUM)
-                loss = (loss_tensor) / self.distributed.get_world_size()
-                if self.distributed.get_rank() == 0:
-                    print(f"World-avg train loss: {loss:.4f}")
-            else:
                 total_loss += train_loss
                 for k, v in metrics.items():
                     accumulated_metrics[k] += v
@@ -348,16 +282,9 @@ class Trainer:
 
         for keypoint, frames_padding_mask, embedding, mask_embedding in self.val_loader:        
             loss, metrics = self._val_batch(keypoint, frames_padding_mask, embedding, mask_embedding)
-            if self.distributed is not None:
-                loss_tensor = loss.to(self.device)
-                self.distributed.all_reduce(loss_tensor, op=self.distributed.ReduceOp.SUM)
-                val_loss = (loss_tensor) / self.distributed.get_world_size()
-                if self.distributed.get_rank() == 0:
-                    print(f"World-avg val loss: {loss:.4f}")
-            else:
-                val_loss += loss
-                for k, v in metrics.items():
-                    accumulated_metrics[k] += v
+            val_loss += loss
+            for k, v in metrics.items():
+                accumulated_metrics[k] += v
 
         # Calculate averages
         final_val_loss = val_loss.item() / len(self.val_loader)
