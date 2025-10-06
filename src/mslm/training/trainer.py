@@ -105,10 +105,16 @@ class Trainer:
         self.weight_decay = kwargs.get("weight_decay", 0.05)
 
     def prepare_trainer(self):
-        self.model = self.accelerator.prepare(self.model)
-        self.optimizer = self.accelerator.prepare_optimizer(self.optimizer)
-        self.scheduler = self.accelerator.prepare_scheduler(self.scheduler)
-
+        """Prepara todo lo necesario para el entrenamiento."""
+        (self.model,
+        self.criterion,
+        self.optimizer,
+        self.scheduler,
+        self.train_loader,
+        self.val_loader) = self.accelerator.prepare(
+            self.model, self.criterion, self.optimizer, self.scheduler,
+            self.train_loader, self.val_loader
+        )
     @nvtx.annotate("Training Section", color="green")
     def train(self, prof = False, load=False):
         """Entrena el modelo Imitator.
@@ -118,9 +124,11 @@ class Trainer:
         """
         print("LR:", self.learning_rate)
         self.optimizer = AdamW(
-            self.model.parameters(), 
-            lr=self.learning_rate, 
-            weight_decay=self.weight_decay,
+            [
+                {"params": self.model.parameters(), "weight_decay": self.weight_decay},
+                {"params": [self.criterion.logit_scale], "weight_decay": 0.0},
+            ],
+            lr=self.learning_rate,
             foreach=True
         )
         

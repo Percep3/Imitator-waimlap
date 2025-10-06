@@ -8,12 +8,15 @@ class ClipContrastiveLoss(nn.Module):
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0 / init_temp)))
         self.max_scale = max_scale
 
-    def forward(self, vid_emb: torch.Tensor, txt_emb: torch.Tensor):        
+    def forward(self, vid_emb: torch.Tensor, txt_emb: torch.Tensor):
+        with torch.no_grad():
+            self.logit_scale.data.clamp_(max=torch.log(torch.tensor(self.max_scale)))
+
         # vid_emb, txt_emb: [B, D] (idealmente ya normalizados)
         v = F.normalize(vid_emb, dim=-1)
         t = F.normalize(txt_emb, dim=-1)
 
-        scale = self.logit_scale.exp().clamp(max=self.max_scale)  # estabilidad
+        scale = self.logit_scale.exp()
         logits_v2t = scale * (v @ t.t())   # [B, B_total]
         logits_t2v = scale * (t @ v.t())   # [B, B_total]
 
