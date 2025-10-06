@@ -10,4 +10,4 @@ batch_sample = 4
 train_ratio = 0.8
 device = "auto"
 weight_decay = 0.03
-grad_clip = 2.9
+grad_clip = 3.5

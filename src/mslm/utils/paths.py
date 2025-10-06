@@ -30,16 +30,16 @@ class PathVariables:
         out.mkdir(parents=True, exist_ok=True)
 
         self.model_path = out / "checkpoints"
-        self.model_path.mkdir(exist_ok=True)
+        #self.model_path.mkdir(exist_ok=True)
 
         self.report_path = out / "reports"
-        self.report_path.mkdir(exist_ok=True)
+        #self.report_path.mkdir(exist_ok=True)
 
         self.logs_path = out / "logs"
-        self.logs_path.mkdir(exist_ok=True)
+        #self.logs_path.mkdir(exist_ok=True)
 
         self.study_path = out / "studies"
-        self.study_path.mkdir(exist_ok=True)
+        #self.study_path.mkdir(exist_ok=True)
 
         # Datos
         dp = bp.parent / "data" / "processed"
