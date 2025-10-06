@@ -163,9 +163,6 @@ class Trainer:
                 self.ckpt_mgr.save_checkpoint(self.model, epoch, self.optimizer, self.scheduler)
             elif self.early_stopping.stop:
                 self.ckpt_mgr.save_checkpoint(self.model, epoch, self.optimizer, self.scheduler)
-            
-            if self.scheduler is not None:
-                self.scheduler.step()
 
             if self.early_stopping.stop:
                 break
@@ -192,6 +189,9 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)        
                 train_loss, metrics = self._train_batch(keypoint, frames_padding_mask, embedding, mask_embedding)
 
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
                 total_loss += train_loss
                 for k, v in metrics.items():
                     accumulated_metrics[k] += v
@@ -209,7 +209,7 @@ class Trainer:
             metrics_str = " ".join([f"{k}: {v:.4f}" for k, v in avg_metrics.items()])
             tqdm.write(f"\nEpoch: {epoch}.\n Train loss: {final_train_loss:.4f} {metrics_str}")
 
-        return total_loss
+        return final_train_loss
 
     def _forward_loss(self, keypoint, frames_padding_mask, embedding, mask_embedding):
         with self.accelerator.autocast():
