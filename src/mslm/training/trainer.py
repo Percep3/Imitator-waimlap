@@ -17,9 +17,19 @@ from torch.optim.lr_scheduler import LambdaLR
 from src.mslm.utils.early_stopping import EarlyStopping
 from src.mslm.checkpoint.manager import CheckpointManager
 # from src.mslm.training import imitator_loss
-from src.mslm.training.loss_msepcossim import imitator_loss
+from src.mslm.training.clip_loss import ClipContrastiveLoss
 import nvtx
 from datetime import datetime
+
+def masked_mean_pool(x: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    x:    [B, T, D]
+    mask: [B, T] con True = válido
+    """
+    mask = mask.unsqueeze(-1).to(x.dtype)  # [B, T, 1]
+    num = (x * mask).sum(dim=dim)
+    den = mask.sum(dim=dim).clamp_min(1e-8)
+    return num / den
 
 class Trainer:
     def __init__(self, model, train_loader, val_loader, learning_rate, save_tb_model=True, **kwargs):
@@ -58,13 +68,13 @@ class Trainer:
         #Loss Function
         if kwargs.get("compile", True):
             self.criterion = torch.compile(
-                imitator_loss,
+                ClipContrastiveLoss(),
                 backend="inductor",
                 mode="default",
                 dynamic=True
             )            
         else:
-            self.criterion = imitator_loss
+            self.criterion = ClipContrastiveLoss()
 
         #Model
         self.model = model
@@ -134,6 +144,8 @@ class Trainer:
         self.prepare_trainer()
         self.prof = prof
 
+        val_loss = 0
+        train_loss = 0
         for epoch in tqdm(range(self.epochs), desc="Entrenando", colour="green"):
             train_loss = self._train_epoch(epoch)
             val_loss = self._val(epoch)
@@ -216,8 +228,12 @@ class Trainer:
     def _train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
-        mse_loss = 0
-        cossim_loss = 0
+        accumulated_metrics = {
+            'acc_v2t': 0.0,
+            'acc_t2v': 0.0,
+            'temp': 0.0
+        }
+
         for keypoint, frames_padding_mask, embedding, mask_embedding in self.train_loader:
             if self.save_tb_model and epoch == 1 and not getattr(self, "graph_added", False):
                 print("Saving graph")
@@ -226,7 +242,7 @@ class Trainer:
             
             with self.accelerator.accumulate(self.model):
                 self.optimizer.zero_grad(set_to_none=True)        
-                train_loss, mse, cossim = self._train_batch(keypoint, frames_padding_mask, embedding, mask_embedding)
+                train_loss, metrics = self._train_batch(keypoint, frames_padding_mask, embedding, mask_embedding)
 
             if self.distributed is not None:
                 loss_tensor = loss.to(self.device)
@@ -236,76 +252,95 @@ class Trainer:
                     print(f"World-avg train loss: {loss:.4f}")
             else:
                 total_loss += train_loss
-                mse_loss += mse
-                cossim_loss += cossim
+                for k, v in metrics.items():
+                    accumulated_metrics[k] += v
                 
+        # Calculate averages
         final_train_loss = total_loss.item()/len(self.train_loader)
-        final_train_loss_mse = mse_loss.item()/len(self.train_loader)
-        final_train_loss_cossim = cossim_loss.item()/len(self.train_loader)
+        avg_metrics = {k: v/len(self.train_loader) for k, v in accumulated_metrics.items()}
 
+        # Log to tensorboard
         self.writer.add_scalar("Loss/train", final_train_loss, epoch)
-        self.writer.add_scalar("Loss/train_mse", final_train_loss_mse, epoch)
-        self.writer.add_scalar("Loss/train_cosim", final_train_loss_cossim, epoch)
+        for k, v in avg_metrics.items():
+            self.writer.add_scalar(f"Metrics/{k}", v, epoch)
 
         if epoch % self.log_interval == 0:
-            tqdm.write(f"\nEpoch: {epoch}.\n Train loss: {final_train_loss} MSE: {final_train_loss_mse} Cossim: {final_train_loss_cossim}")
+            metrics_str = " ".join([f"{k}: {v:.4f}" for k, v in avg_metrics.items()])
+            tqdm.write(f"\nEpoch: {epoch}.\n Train loss: {final_train_loss:.4f} {metrics_str}")
 
         return total_loss
 
     def _forward_loss(self, keypoint, frames_padding_mask, embedding, mask_embedding):
         with self.accelerator.autocast():
-            output, _ = self.model(keypoint, frames_padding_mask)
-            loss, mse, cossim = self.criterion(output, embedding, mask_embedding)            
-        return loss, mse, cossim
+            output, pool_out = self.model(keypoint, frames_padding_mask)
+            text_emb = masked_mean_pool(embedding, mask_embedding, dim=1)
+            loss, metrics = self.criterion(pool_out, text_emb)            
+        return loss, metrics
 
     @nvtx.annotate("Train: Train Batch", color="green")
     def _train_batch(self, keypoint, frames_padding_mask, embedding, mask_embedding):
         batch_loss = 0.0
-        batch_mse, batch_cossim = 0.0, 0.0 
+        accumulated_metrics = {
+            'acc_v2t': 0.0,
+            'acc_t2v': 0.0,
+            'temp': 0.0
+        }
 
         batch_size = keypoint.size(0)
         start = 0
         end = keypoint.size(0)
+        
+        # Si batch_sampling es False, procesamos todo el batch de una vez
+        n_sub_batch = 1
         if self.batch_sampling:
             n_sub_batch = (batch_size + self.sub_batch - 1) // self.sub_batch
 
         with nvtx.annotate("Sub_batch", color="blue"):
             with torch.autograd.set_detect_anomaly(True):
                 for i in range(n_sub_batch):
+                    # Actualizar índices solo si estamos haciendo batch sampling
                     if self.batch_sampling:
                         start = i * self.sub_batch
                         end = min(start + self.sub_batch, batch_size)
-                        with nvtx.annotate("Forward Pass", color="blue"):
-                            loss, mse, cossim = self._forward_loss(keypoint[start:end], 
-                                                        frames_padding_mask[start:end], 
-                                                        embedding[start:end], 
-                                                        mask_embedding[start:end])
-                        if self.batch_sampling:
-                            loss /= n_sub_batch
-                            mse /= n_sub_batch
-                            cossim /= n_sub_batch
+                    
+                    with nvtx.annotate("Forward Pass", color="blue"):
+                        loss, metrics = self._forward_loss(keypoint[start:end], 
+                                                    frames_padding_mask[start:end], 
+                                                    embedding[start:end], 
+                                                    mask_embedding[start:end])
+                    
+                    # Normalizar pérdida y métricas si estamos haciendo batch sampling
+                    if self.batch_sampling:
+                        loss /= n_sub_batch
+                        for k in metrics:
+                            metrics[k] /= n_sub_batch
 
-                        with nvtx.annotate("Backward Pass", color="blue"):
-                            torch.autograd.set_detect_anomaly(True)
-                            self.accelerator.backward(loss)
-                        batch_loss += loss.detach()
-                        batch_mse += mse.detach()
-                        batch_cossim += cossim.detach()
+                    with nvtx.annotate("Backward Pass", color="blue"):
+                        torch.autograd.set_detect_anomaly(True)
+                        self.accelerator.backward(loss)
+                    
+                    batch_loss += loss.detach()
+                    for k, v in metrics.items():
+                        accumulated_metrics[k] += v
 
             with nvtx.annotate("Step", color="blue"):
                 self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
                 self.optimizer.step()
 
-        return batch_loss, batch_mse, batch_cossim
+        return batch_loss, accumulated_metrics
 
     @nvtx.annotate("Validation Section", color="green")
     def _val(self, epoch):
         self.model.eval()
-        val_loss=0
-        mse_loss = 0
-        cossim_loss = 0
+        val_loss = 0
+        accumulated_metrics = {
+            'acc_v2t': 0.0,
+            'acc_t2v': 0.0,
+            'temp': 0.0
+        }
+
         for keypoint, frames_padding_mask, embedding, mask_embedding in self.val_loader:        
-            loss, mse, cossim = self._val_batch(keypoint, frames_padding_mask, embedding, mask_embedding)
+            loss, metrics = self._val_batch(keypoint, frames_padding_mask, embedding, mask_embedding)
             if self.distributed is not None:
                 loss_tensor = loss.to(self.device)
                 self.distributed.all_reduce(loss_tensor, op=self.distributed.ReduceOp.SUM)
@@ -314,54 +349,64 @@ class Trainer:
                     print(f"World-avg val loss: {loss:.4f}")
             else:
                 val_loss += loss
-                mse_loss += mse
-                cossim_loss += cossim
+                for k, v in metrics.items():
+                    accumulated_metrics[k] += v
 
+        # Calculate averages
         final_val_loss = val_loss.item() / len(self.val_loader)
-        final_mse_loss = mse_loss.item() / len(self.val_loader)
-        final_cossim_loss = cossim_loss.item() / len(self.val_loader)
+        avg_metrics = {k: v/len(self.val_loader) for k, v in accumulated_metrics.items()}
+
+        # Log to tensorboard
         self.writer.add_scalar("Loss/val", final_val_loss, epoch)
-        self.writer.add_scalar("Loss/val_mse", final_mse_loss, epoch)
-        self.writer.add_scalar("Loss/val_cossim", final_cossim_loss, epoch)
-        self.writer.add_scalar("Loss/val_mse", final_mse_loss, epoch)
-        self.writer.add_scalar("Loss/val_cossim", final_cossim_loss, epoch)
+        for k, v in avg_metrics.items():
+            self.writer.add_scalar(f"Val_Metrics/{k}", v, epoch)
 
         if epoch % self.log_interval == 0:
-            tqdm.write(f"Validation loss: {final_val_loss} MSE: {final_mse_loss} Cossim: {final_cossim_loss}")
+            metrics_str = " ".join([f"{k}: {v:.4f}" for k, v in avg_metrics.items()])
+            tqdm.write(f"Validation loss: {final_val_loss:.4f} {metrics_str}")
 
         self.early_stopping(final_val_loss)
         return final_val_loss
 
     @nvtx.annotate("Val: Validate Batch", color="green")
-    def _val_batch(self, keypoint, frames_padding_mask, embedding, mask_embedding) -> t.Tuple[float, float, float]:
+    def _val_batch(self, keypoint, frames_padding_mask, embedding, mask_embedding) -> t.Tuple[torch.Tensor, dict]:
         batch_loss = 0.0
-        batch_mse = 0.0
-        batch_cossim = 0.0
+        accumulated_metrics = {
+            'acc_v2t': 0.0,
+            'acc_t2v': 0.0,
+            'temp': 0.0
+        }
         
         batch_size = keypoint.size(0)
         start = 0
         end = keypoint.size(0)
-
+        
+        # Si batch_sampling es False, procesamos todo el batch de una vez
+        n_sub_batch = 1
         if self.batch_sampling:
             n_sub_batch = (batch_size + self.sub_batch - 1) // self.sub_batch
 
         with nvtx.annotate("Val: Forward + Loss", color="blue"):
             for i in range(n_sub_batch):
+                # Actualizar índices solo si estamos haciendo batch sampling
                 if self.batch_sampling:
                     start = i * self.sub_batch
-                    end = min(start + self.sub_batch, batch_size)                
+                    end = min(start + self.sub_batch, batch_size)
+                
                 with nvtx.annotate("Forward Pass", color="blue"):
-                    loss, mse, cossim = self._forward_loss(keypoint[start:end], 
+                    loss, metrics = self._forward_loss(keypoint[start:end], 
                                                 frames_padding_mask[start:end], 
                                                 embedding[start:end], 
                                                 mask_embedding[start:end])
+                
+                # Normalizar pérdida y métricas si estamos haciendo batch sampling
                 if self.batch_sampling:
                     loss /= n_sub_batch
-                    mse /= n_sub_batch
-                    cossim /= n_sub_batch
+                    for k in metrics:
+                        metrics[k] /= n_sub_batch
                         
                 batch_loss += loss.detach()
-                batch_mse += mse.detach()
-                batch_cossim += cossim.detach()
+                for k, v in metrics.items():
+                    accumulated_metrics[k] += v
 
-        return batch_loss, batch_mse, batch_cossim
+        return batch_loss, accumulated_metrics

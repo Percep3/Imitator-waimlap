@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from .components import TransformerEncoderLayerRoPE
 import torch.utils.checkpoint as checkpoint
+import typing as t
+import torch.nn.functional as F
 
 class Imitator(nn.Module):
     def __init__(
@@ -15,7 +17,8 @@ class Imitator(nn.Module):
         max_seq_length: int = 301,
         encoder_dropout: int = 0.4,
         cross_attention_dropout: int = 0.4,
-        pool_dim: int = 256
+        pool_dim: int = 256,
+        pool_strategy: t.Literal['cls', 'mean'] = 'cls'
     ):
         super().__init__()
         
@@ -29,8 +32,10 @@ class Imitator(nn.Module):
             "max_seq_length": max_seq_length,
             "encoder_dropout": encoder_dropout,
             "cross_attention_dropout": cross_attention_dropout,
-            "pool_dim": pool_dim
+            "pool_dim": pool_dim,
+            "pool_strategy": pool_strategy,
         }
+        self.pool_strategy = pool_strategy
 
         # --- Bloque de entrada ---
 
@@ -86,8 +91,16 @@ class Imitator(nn.Module):
             nn.Linear(output_size * 2, output_size)
         )
 
+    @torch.no_grad()
+    def _pool_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.pool_strategy == 'mean':
+            v = tokens.mean(dim=1)
+        else: # para cls o por defecto
+            v = tokens[:, 0, :]
+        return F.normalize(v, dim=-1)
+    
     @torch.compile(dynamic=True)
-    def forward(self, x:torch.Tensor, frames_padding_mask:torch.Tensor=None) -> torch.Tensor:
+    def forward(self, x:torch.Tensor, frames_padding_mask:torch.Tensor=None) -> t.Tuple[torch.Tensor, torch.Tensor]:
         """
         x: Tensor of frames
         returns: Tensor of embeddings for each token (128 tokens of frames)
@@ -141,4 +154,4 @@ class Imitator(nn.Module):
         x = self.norm_attn(Q + attn_out)
         # print(f"Attention output shape: {attn_out.shape}, Q shape: {Q.shape}, M shape: {M.shape}")
         x = x + self.proj_final(attn_out)        # [B, n_tokens, output_size]
-        return x
+        return x, self._pool_tokens(x)  # [B, n_tokens, output_size], [B, output_size]
