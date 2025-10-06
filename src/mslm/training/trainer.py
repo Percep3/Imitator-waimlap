@@ -241,7 +241,6 @@ class Trainer:
     def _train_batch(self, keypoint, frames_padding_mask, embedding, mask_embedding):
         self.optimizer.zero_grad(set_to_none=True)
 
-        embs_v, embs_t = []
         embs_v, embs_t = [], []
         batch_size = keypoint.size(0)
         n_sub_batch = (batch_size + self.sub_batch - 1) // self.sub_batch if self.batch_sampling else 1
@@ -309,7 +308,7 @@ class Trainer:
 
         self.early_stopping(final_val_loss)
         return final_val_loss
-
+    
     @nvtx.annotate("Val: Validate Batch", color="green")
     def _val_batch(self, keypoint, frames_padding_mask, embedding, mask_embedding) -> t.Tuple[torch.Tensor, dict]:
         batch_loss = 0.0
