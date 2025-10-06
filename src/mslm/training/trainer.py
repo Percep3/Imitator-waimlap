@@ -180,6 +180,12 @@ class Trainer:
         }
 
         for keypoint, frames_padding_mask, embedding, mask_embedding in self.train_loader:
+            # DEBUG
+            if epoch == 0:
+                with torch.no_grad():
+                    mv = (~mask_embedding.bool()).sum(dim=1)  # #tokens válidos por muestra
+                    tqdm.write(f"[DEBUG] valid_tokens_text: min={mv.min().item()}, mean={mv.float().mean().item():.2f}")
+
             if self.save_tb_model and epoch == 1 and not getattr(self, "graph_added", False):
                 print("Saving graph")
                 self.writer.add_graph(self.model, (keypoint, frames_padding_mask))
@@ -214,61 +220,63 @@ class Trainer:
     def _forward_loss(self, keypoint, frames_padding_mask, embedding, mask_embedding):
         with self.accelerator.autocast():
             output, pool_out = self.model(keypoint, frames_padding_mask)
-            text_emb = masked_mean_pool(embedding, mask_embedding, dim=1)
+            mask_valid = ~mask_embedding.bool()   # True = válido
+            if (mask_valid.sum(dim=1) == 0).any():
+                # si alguna fila quedó sin válidos, se hace todo válido en esa fila
+                fix = (mask_valid.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+                mask_valid[fix] = True
+                
+            text_emb = masked_mean_pool(embedding, mask_valid, dim=1)
+            
+            # DEBUG
+            if not hasattr(self, "_dbg_done"):
+                tqdm.write(f"[DEBUG] ||pool|| mean={pool_out.norm(dim=1).mean().item():.3f}  "
+                    f"||text|| mean={text_emb.norm(dim=1).mean().item():.3f}")
+                self._dbg_done = True
+
             loss, metrics = self.criterion(pool_out, text_emb)            
         return loss, metrics
 
     @nvtx.annotate("Train: Train Batch", color="green")
     def _train_batch(self, keypoint, frames_padding_mask, embedding, mask_embedding):
-        batch_loss = 0.0
-        accumulated_metrics = {
-            'acc_v2t': 0.0,
-            'acc_t2v': 0.0,
-            'temp': 0.0
-        }
+        self.optimizer.zero_grad(set_to_none=True)
 
+        embs_v, embs_t = []
+        embs_v, embs_t = [], []
         batch_size = keypoint.size(0)
-        start = 0
-        end = keypoint.size(0)
-        
-        # Si batch_sampling es False, procesamos todo el batch de una vez
-        n_sub_batch = 1
-        if self.batch_sampling:
-            n_sub_batch = (batch_size + self.sub_batch - 1) // self.sub_batch
+        n_sub_batch = (batch_size + self.sub_batch - 1) // self.sub_batch if self.batch_sampling else 1
 
-        with nvtx.annotate("Sub_batch", color="blue"):
-            with torch.autograd.set_detect_anomaly(True):
-                for i in range(n_sub_batch):
-                    # Actualizar índices solo si estamos haciendo batch sampling
-                    if self.batch_sampling:
-                        start = i * self.sub_batch
-                        end = min(start + self.sub_batch, batch_size)
-                    
-                    with nvtx.annotate("Forward Pass", color="blue"):
-                        loss, metrics = self._forward_loss(keypoint[start:end], 
-                                                    frames_padding_mask[start:end], 
-                                                    embedding[start:end], 
-                                                    mask_embedding[start:end])
-                    
-                    # Normalizar pérdida y métricas si estamos haciendo batch sampling
-                    if self.batch_sampling:
-                        loss /= n_sub_batch
-                        for k in metrics:
-                            metrics[k] = metrics[k].item() / n_sub_batch
+        for i in range(n_sub_batch):
+            start = i * self.sub_batch if self.batch_sampling else 0
+            end   = min(start + self.sub_batch, batch_size) if self.batch_sampling else batch_size
 
-                    with nvtx.annotate("Backward Pass", color="blue"):
-                        torch.autograd.set_detect_anomaly(True)
-                        self.accelerator.backward(loss)
-                    
-                    batch_loss += loss.detach()
-                    for k, v in metrics.items():
-                        accumulated_metrics[k] += v
+            with self.accelerator.autocast():
+                _, v = self.model(keypoint[start:end], frames_padding_mask[start:end])
 
-            with nvtx.annotate("Step", color="blue"):
-                self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
-                self.optimizer.step()
+                mask_valid = ~mask_embedding[start:end].bool()
+                if (mask_valid.sum(dim=1) == 0).any():
+                    fix = (mask_valid.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+                    mask_valid[fix] = True
+                t = masked_mean_pool(embedding[start:end], mask_valid, dim=1)
 
-        return batch_loss, accumulated_metrics
+            embs_v.append(v)
+            embs_t.append(t)
+
+        V = torch.cat(embs_v, dim=0)  # [B,D]
+        T = torch.cat(embs_t, dim=0)  # [B,D]
+
+        loss, metrics = self.criterion(V, T)
+
+        self.accelerator.backward(loss)
+        self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+        self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()  # por batch
+
+        # logging
+        batch_loss = loss.detach()
+        acc_metrics = {k: (v.item() if torch.is_tensor(v) else float(v)) for k, v in metrics.items()}
+        return batch_loss, acc_metrics
 
     @nvtx.annotate("Validation Section", color="green")
     def _val(self, epoch):
