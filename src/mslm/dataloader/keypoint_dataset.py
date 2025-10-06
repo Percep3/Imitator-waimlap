@@ -60,15 +60,15 @@ class KeypointDataset(Dataset):
             self.original_videos = []
 
             for dataset in datasets:
-                if dataset not in ["dataset1", "dataset3", "dataset5", "dataset7"]:
-                    continue
+                #if dataset not in ["dataset1", "dataset3", "dataset5", "dataset7"]:
+                #    continue
 
                 clip_ids  = list(f[dataset]["embeddings"].keys())
 
                 for clip in clip_ids:
                     try:
                         shape = f[dataset]["keypoints"][clip].shape[0]
-
+            
                         if shape < self.max_length:
                             self.valid_index.append((dataset, clip))
                             self.video_lengths.append(shape)
@@ -142,7 +142,7 @@ class KeypointDataset(Dataset):
             if self.return_label:
                 label = f[mapped_idx[0]]["labels"][mapped_idx[1]][:][0].decode()
 
-        keypoint = remove_keypoints(keypoint)
+        #keypoint = remove_keypoints(keypoint)
         keypoint = normalize_augment_data(keypoint, "Original", self.n_keypoints)
 
         if not isinstance(embedding, torch.Tensor):

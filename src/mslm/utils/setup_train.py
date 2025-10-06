@@ -76,9 +76,9 @@ def create_dataloaders(train_dataset, validation_dataset, batch_size, num_worker
 
 def build_model(input_size, output_size, **kwargs):
     """Construye, compila y retorna el modelo Imitator."""
-    adjacency_matrix = np.load(path_vars.A_matrix, allow_pickle=True)
+    #adjacency_matrix = np.load(path_vars.A_matrix, allow_pickle=True)
 
-    model = Imitator(A=adjacency_matrix, input_size=input_size, output_size=output_size, **kwargs)
+    model = Imitator(input_size=input_size, output_size=output_size, **kwargs)
     print(model)
     print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f} M parameters")
     return model
