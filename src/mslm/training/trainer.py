@@ -104,7 +104,6 @@ class Trainer:
         self.grad_clip = kwargs.get("grad_clip", 0.1)
         self.weight_decay = kwargs.get("weight_decay", 0.05)
 
-
     def prepare_trainer(self):
         self.model = self.accelerator.prepare(self.model)
         self.optimizer = self.accelerator.prepare_optimizer(self.optimizer)

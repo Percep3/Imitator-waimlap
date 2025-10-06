@@ -8,6 +8,7 @@ from tqdm import trange
 import torch._dynamo
 import gc
 import numpy as np
+import math
 
 from src.mslm.utils.early_stopping import EarlyStopping
 from src.mslm.utils.paths import path_vars
@@ -33,46 +34,40 @@ def lr_objetive(trial, train_dataloader, val_dataloader, **params):
     return val_loss
 
 def complete_objective(trial, train_dataloader, val_dataloader, model_params, train_config):
-    adjacency_matrix = np.load(path_vars.A_matrix, allow_pickle=True)
-
-    encoder_hidden_size   = trial.suggest_int("encoder_hidden_size", 256, 1024, step=256)
-    decoder_hidden_size   = trial.suggest_int("decoder_hidden_size", 512, 1024, step=256)
+    hidden_size   = trial.suggest_int("encoder_hidden_size", 256, 1024, step=256)
     nhead         = trial.suggest_categorical("nhead", [2, 4, 8])
     ff_dim        = trial.suggest_int("ff_dim", 1024, 3072, step=256)
+    n_layers        = trial.suggest_int("n_encoder_layers", 2, 8, step=2)
+    encoder_dropout = trial.suggest_float("encoder_dropout", 0.1, 0.6, step=0.05)
+    cross_attention_dropout = trial.suggest_float("cross_attention_dropout", 0.1, 0.6, step=0.05)
+    pool_dim   = trial.suggest_int("pool_dim", 256, 512, step=128)
+    pool_strategy = trial.suggest_categorical("pool_strategy", ['cls', 'mean'])
 
     learning_rate = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    n_encoder_layers        = trial.suggest_int("n_encoder_layers", 2, 8, step=2)
-    n_decoder_layers        = trial.suggest_int("n_decoder_layers", 2, 8, step=2)
-    encoder_dropout = trial.suggest_float("encoder_dropout", 0.1, 0.6, step=0.05)
-    decoder_dropout = trial.suggest_float("decoder_dropout", 0.1, 0.6, step=0.05)
 
     weight_decay  = trial.suggest_float("weight_decay", 0.0, 0.1, step=0.01)
     grad_clip    = trial.suggest_float("grad_clip", 0.1, 5.0, step=0.1)
 
-    print(f"Encoder Hidden Size: {encoder_hidden_size}, Decoder Hidden Size: {decoder_hidden_size}, Nhead: {nhead}, FF Dim: {ff_dim}, Encoder Layers: {n_encoder_layers}, Decoder Layers: {n_decoder_layers}, Learning Rate: {learning_rate}")
-    print(f"Encoder Dropout: {encoder_dropout}, Decoder Dropout: {decoder_dropout}")
     train_config["learning_rate"] = learning_rate
     train_config["grad_clip"] = grad_clip
 
     early_stopping = EarlyStopping(patience=10)
-    trainer.early_stopping = early_stopping
 
     model = Imitator(
-        A = adjacency_matrix,
         input_size=model_params["input_size"],
         output_size=model_params["output_size"],
-        encoder_hidden_size = encoder_hidden_size, 
-        decoder_hidden_size = decoder_hidden_size,
+        hidden_size = hidden_size, 
         nhead=nhead,
         ff_dim=ff_dim,
-        n_encoder_layers = n_encoder_layers,
-        n_decoder_layers = n_decoder_layers,
-        max_seq_length=20,
+        n_layers = n_layers,
         encoder_dropout = encoder_dropout, 
-        decoder_dropout = decoder_dropout
+        cross_attention_dropout = cross_attention_dropout, 
+        pool_dim=pool_dim,
+        pool_strategy=pool_strategy
     )
 
     trainer = Trainer(model, train_dataloader, val_dataloader,save_tb_model=False , **train_config)
+    trainer.early_stopping = early_stopping
 
     trainer.optimizer = AdamW(
         trainer.model.parameters(), 
@@ -95,9 +90,15 @@ def complete_objective(trial, train_dataloader, val_dataloader, model_params, tr
     trainer.scheduler = LambdaLR(trainer.optimizer, lr_lambda=lr_lambda)
     trainer.prepare_trainer()
 
+    val_loss = 0
     for epoch in trange(trainer.epochs, desc="Epochs"):
-        train_loss = trainer._train_epoch(epoch)
+        
+        _          = trainer._train_epoch(epoch)
         val_loss   = trainer._val(epoch)
+
+        #if not np.isfinite(val_loss):
+        #    raise TrialPruned("val_loss is NaN/Inf")
+
         trainer.scheduler.step()
         torch.cuda.empty_cache()
 

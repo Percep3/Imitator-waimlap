@@ -1,5 +1,5 @@
-import os
-#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+from settings import initialize
+initialize()
 
 import optuna
 import torch
