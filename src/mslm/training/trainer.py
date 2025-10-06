@@ -254,7 +254,7 @@ class Trainer:
                     if self.batch_sampling:
                         loss /= n_sub_batch
                         for k in metrics:
-                            metrics[k] /= n_sub_batch
+                            metrics[k] = metrics[k].item() / n_sub_batch
 
                     with nvtx.annotate("Backward Pass", color="blue"):
                         torch.autograd.set_detect_anomaly(True)
@@ -328,10 +328,11 @@ class Trainer:
                     end = min(start + self.sub_batch, batch_size)
                 
                 with nvtx.annotate("Forward Pass", color="blue"):
-                    loss, metrics = self._forward_loss(keypoint[start:end], 
-                                                frames_padding_mask[start:end], 
-                                                embedding[start:end], 
-                                                mask_embedding[start:end])
+                    with torch.no_grad():
+                        loss, metrics = self._forward_loss(keypoint[start:end], 
+                                                    frames_padding_mask[start:end], 
+                                                    embedding[start:end], 
+                                                    mask_embedding[start:end])
                 
                 # Normalizar pérdida y métricas si estamos haciendo batch sampling
                 if self.batch_sampling:

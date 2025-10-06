@@ -96,8 +96,8 @@ def complete_objective(trial, train_dataloader, val_dataloader, model_params, tr
         _          = trainer._train_epoch(epoch)
         val_loss   = trainer._val(epoch)
 
-        #if not np.isfinite(val_loss):
-        #    raise TrialPruned("val_loss is NaN/Inf")
+        if not np.isfinite(val_loss):
+            raise TrialPruned("val_loss is NaN/Inf")
 
         trainer.scheduler.step()
         torch.cuda.empty_cache()

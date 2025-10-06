@@ -29,6 +29,6 @@ class ClipContrastiveLoss(nn.Module):
         with torch.no_grad():
             acc_v = (logits_v2t.argmax(dim=1) == targets).float().mean()
             acc_t = (logits_t2v.argmax(dim=1) == targets).float().mean()
-            temp = 1.0 / scale.item()
+            temp = 1.0 / scale
 
-        return loss, {"acc_v2t": acc_v.item(), "acc_t2v": acc_t.item(), "temp": temp}
+        return loss, {"acc_v2t": acc_v, "acc_t2v": acc_t, "temp": temp}
