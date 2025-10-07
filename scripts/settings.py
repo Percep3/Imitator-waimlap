@@ -1,3 +1,5 @@
+DEBUG = False
+
 def initialize():
     print("Loading settings")   
     import os

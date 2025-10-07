@@ -9,6 +9,7 @@ import random
 torch.manual_seed(23)
 random.seed(23)
 
+from scripts.settings import DEBUG
 from torch.optim.swa_utils import AveragedModel
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
@@ -187,7 +188,7 @@ class Trainer:
 
         for keypoint, frames_padding_mask, embedding, mask_embedding, label in self.train_loader:
             # DEBUG
-            if epoch == 0:
+            if DEBUG and epoch == 0:
                 with torch.no_grad():
                     mv = (~mask_embedding.bool()).sum(dim=1)  # #tokens válidos por muestra
                     tqdm.write(f"[DEBUG] valid_tokens_text: min={mv.min().item()}, mean={mv.float().mean().item():.2f}")
@@ -201,7 +202,7 @@ class Trainer:
                 # self.optimizer.zero_grad(set_to_none=True)
                 train_loss, metrics = self._train_batch(keypoint, frames_padding_mask, embedding, mask_embedding, label)
 
-                if not hasattr(self, "_lrchk"):
+                if DEBUG and not hasattr(self, "_lrchk"):
                     self.accelerator.print(f"[LR] {self.optimizer.param_groups[0]['lr']:.3e}")
                     self._lrchk = True
 
@@ -236,8 +237,8 @@ class Trainer:
                 mask_embedding[idx, 0] = False
                         
             # DEBUG
-            if not hasattr(self, "_dbg_val_text"):
-                # conteo de tokens válidos (True=PAD → ~text_pad es válido)
+            if DEBUG and not hasattr(self, "_dbg_val_text"):
+                # conteo de tokens válidos
                 tv = (~mask_embedding.bool()).sum(dim=1)
                 # stats del embedding crudo SOLO en posiciones válidas
                 m = ~mask_embedding.bool()
@@ -252,7 +253,7 @@ class Trainer:
             text_emb = F.normalize(torch.nan_to_num(text_emb), dim=-1)
             
             # DEBUG
-            if not hasattr(self, "_dbg_done"):
+            if DEBUG and not hasattr(self, "_dbg_done"):
                 tqdm.write(f"[DEBUG] ||pool|| mean={pool_out.norm(dim=1).mean().item():.3f}  "
                     f"||text|| mean={text_emb.norm(dim=1).mean().item():.3f}")
                 self._dbg_done = True
@@ -279,7 +280,7 @@ class Trainer:
                 pre_norm = t.norm(dim=1)
                 
                 # DEBUG
-                if not hasattr(self, "_val_t_once"):
+                if DEBUG and not hasattr(self, "_val_t_once"):
                     self.accelerator.print(f"[VAL-CHK] text_emb pre-norm: min={pre_norm.min().item():.4e} mean={pre_norm.mean().item():.4e}")
                     self._val_t_once = True
             v = torch.nan_to_num(v)
@@ -294,7 +295,7 @@ class Trainer:
         V = torch.cat(embs_v, dim=0)  # [B,D]
         T = torch.cat(embs_t, dim=0)  # [B,D]
 
-        if not hasattr(self, "_dbg_once"):
+        if DEBUG and not hasattr(self, "_dbg_once"):
             vf = (~frames_padding_mask.bool()).sum(dim=1)
             vt = (~mask_embedding.bool()).sum(dim=1)
             self.accelerator.print(f"[DEBUG] frames valid/min={vf.min().item()} mean={vf.float().mean().item():.2f} | "
@@ -306,7 +307,7 @@ class Trainer:
         loss, metrics = self.criterion(V, T, labels=label_ids)
 
         self.accelerator.backward(loss)
-        if not hasattr(self, "_gradchk"):
+        if DEBUG and not hasattr(self, "_gradchk"):
             with torch.no_grad():
                 g = 0.0
                 n = 0
@@ -377,7 +378,6 @@ class Trainer:
                 s = i * self.sub_batch if self.batch_sampling else 0
                 e = min(s + self.sub_batch, batch_size) if self.batch_sampling else batch_size
 
-                # --- Modelo con PAD=True (coherente con forward del modelo)
                 # Garantiza ≥1 frame válido
                 pad_frames = frames_padding_mask[s:e].clone()
                 if ((~pad_frames).sum(dim=1) == 0).any():
@@ -385,7 +385,6 @@ class Trainer:
                     pad_frames[idx, 0] = False
                 _, v = self.model(keypoint[s:e], pad_frames)
 
-                # --- Texto: PAD=True al pooling
                 pad_text = mask_embedding[s:e].clone()
                 if ((~pad_text).sum(dim=1) == 0).any():
                     idx = ((~pad_text).sum(dim=1) == 0).nonzero(as_tuple=True)[0]
@@ -402,13 +401,11 @@ class Trainer:
             T = torch.cat(embs_t, dim=0)
 
             labels_ids = torch.as_tensor(labels, dtype=torch.long, device=V.device)
-            if flag:
+            if DEBUG and flag:
                 with torch.no_grad():
                     # supongamos que 'labels' es un vector [B] de IDs emparejados video↔texto
-                    # 1) ¿Los índices diagonales realmente son positivos?
-                    # (asumiendo DataLoader no baraja video y texto por separado)
                     assert V.size(0) == T.size(0)
-                    # 2) diagnostiquemos “vecino más cercano comparte etiqueta”
+                    # diagnostiquemos “vecino más cercano comparte etiqueta”
                     S = (V @ T.t()).float()  # [B,B]
                     nn_t = S.argmax(dim=1)   # mejor texto para cada video
                     nn_v = S.argmax(dim=0)   # mejor video para cada texto
@@ -416,7 +413,7 @@ class Trainer:
                     top1_t_shares_label = (labels_ids == labels_ids[nn_v]).float().mean().item()
                     self.accelerator.print(f"[VAL-PAIR] share_label_v2t={top1_v_shares_label:.3f} share_label_t2v={top1_t_shares_label:.3f}")
 
-
+                # DEBUG
                 with torch.no_grad():
                     S = (V @ T.t()).float()
                     B = S.size(0)
@@ -429,7 +426,7 @@ class Trainer:
                     )
                     flag = False
 
-            if not hasattr(self, "_dbg_val_once"):
+            if DEBUG and not hasattr(self, "_dbg_val_once"):
                 vf = (~frames_padding_mask.bool()).sum(dim=1)
                 vt = (~mask_embedding.bool()).sum(dim=1)
                 self.accelerator.print(f"[VAL-DEBUG] frames valid/min={vf.min().item()} mean={vf.float().mean().item():.2f} | "
