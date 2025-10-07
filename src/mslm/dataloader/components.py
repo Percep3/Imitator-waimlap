@@ -11,9 +11,11 @@ def collate_fn(batch):
       frames_mask       → [B, T_max]     (True = padding)
       embeddings_padded → [B, N_max, E]
       embeddings_mask   → [B, N_max]     (True = padding)
+      labels            → List of labels
     """
     keypoints_list  = [item[0] for item in batch]
     embeddings_list = [item[1] for item in batch]
+    labels = [item[2] for item in batch]
 
     # Normaliza embeddings a [N, E]
     for i in range(len(embeddings_list)):
@@ -42,5 +44,6 @@ def collate_fn(batch):
         keypoints_padded.to(torch.float32),
         frames_mask.to(torch.bool),
         embeddings_padded.to(torch.float32),
-        embeddings_mask.to(torch.bool)
+        embeddings_mask.to(torch.bool),
+        labels
     )

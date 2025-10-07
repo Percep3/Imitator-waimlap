@@ -28,7 +28,7 @@ def setup_paths():
 
 def prepare_datasets(h5File, train_ratio, n_keypoints=111):
     """Carga el dataset base, lo envuelve y lo divide en entrenamiento y validación."""
-    keypoint_reader = KeypointDataset(h5Path=h5File, return_label=False, n_keypoints=n_keypoints, data_augmentation=False, max_length=4000)
+    keypoint_reader = KeypointDataset(h5Path=h5File, return_label=True, n_keypoints=n_keypoints, data_augmentation=False, max_length=4000)
     train_dataset, validation_dataset, train_length, val_length = keypoint_reader.split_dataset(train_ratio)
 
     print(f"Train size:\t{len(train_dataset)}\nValidation size:\t{len(validation_dataset)}")

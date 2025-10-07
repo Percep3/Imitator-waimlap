@@ -1,5 +1,6 @@
 import h5py
-import numpy as np
+import json
+import os
 import torch
 from typing import Optional, List, Tuple
 from torch.utils.data import random_split, Dataset, Subset, ConcatDataset
@@ -33,7 +34,7 @@ class TransformedSubset(Dataset):
         return keypoint, embedding, None
 
 class KeypointDataset(Dataset):
-    def __init__(self, h5Path, n_keypoints=111, transform=None, return_label=False, max_length=4000, data_augmentation=True):
+    def __init__(self, h5Path, n_keypoints=111, transform=None, return_label=False, max_length=4000, data_augmentation=True, labels_vocab_path=None):
         self.h5Path = h5Path
         self.n_keypoints = n_keypoints
         self.transform = transform
@@ -51,6 +52,37 @@ class KeypointDataset(Dataset):
 
         self.dataset_length = 0
         self.processData()
+
+        self.labels_vocab_path = labels_vocab_path or (os.path.splitext(h5Path)[0] + "_labels_vocab.json")
+        self.label_to_id = {}
+        self.id_to_label = []
+
+        if self.return_label:
+            self._build_or_load_label_vocab()
+
+    def _build_or_load_label_vocab(self):
+        # Si ya existe, cargar
+        if os.path.exists(self.labels_vocab_path):
+            with open(self.labels_vocab_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.id_to_label = data["id_to_label"]
+            self.label_to_id = {s: i for i, s in enumerate(self.id_to_label)}
+            return
+
+        # Si no existe, recorrer solo los índices válidos y recolectar labels
+        labels_set = set()
+        with h5py.File(self.h5Path, 'r') as f:
+            for (dataset, clip) in self.valid_index:
+                s = f[dataset]["labels"][clip][:][0].decode()
+                labels_set.add(s)
+
+        # Vocab ordenado para estabilidad
+        self.id_to_label = sorted(labels_set)
+        self.label_to_id = {s: i for i, s in enumerate(self.id_to_label)}
+
+        # Guardar a disco (recomendado)
+        with open(self.labels_vocab_path, "w", encoding="utf-8") as f:
+            json.dump({"id_to_label": self.id_to_label}, f, ensure_ascii=False, indent=2)
 
     def processData(self):
         with h5py.File(self.h5Path, 'r') as f:
@@ -90,7 +122,7 @@ class KeypointDataset(Dataset):
             aug_subsets = [
                 TransformedSubset(train_subset, 
                                   transform_fn=tf,
-                                  return_label=False,
+                                  return_label=self.return_label,
                                   video_lengths=train_length,
                                   n_keypoints=self.n_keypoints
                                   )
@@ -118,7 +150,7 @@ class KeypointDataset(Dataset):
     def __len__(self):
         return len(self.valid_index)
 
-    def __getitem__(self, idx) -> Tuple[torch.Tensor, Optional[np.ndarray], torch.Tensor, Optional[str]]:
+    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor, Optional[int]]:
         """
         Recupera una muestra individual del conjunto de datos.
         Este método recupera los puntos clave, la matriz de adyacencia, los embeddings y opcionalmente las etiquetas
@@ -135,13 +167,15 @@ class KeypointDataset(Dataset):
         """
         
         mapped_idx = self.valid_index[idx]
-            
+        label_id = None
+
         with h5py.File(self.h5Path, 'r') as f:
             keypoint = f[mapped_idx[0]]["keypoints"][mapped_idx[1]][:]
             embedding = f[mapped_idx[0]]["embeddings"][mapped_idx[1]][:]
     
             if self.return_label:
-                label = f[mapped_idx[0]]["labels"][mapped_idx[1]][:][0].decode()
+                label_str = f[mapped_idx[0]]["labels"][mapped_idx[1]][:][0].decode()
+                label_id = self.label_to_id[label_str]
 
         #keypoint = remove_keypoints(keypoint)
         keypoint = normalize_augment_data(keypoint, "Original", self.n_keypoints)
@@ -150,6 +184,7 @@ class KeypointDataset(Dataset):
             embedding = torch.as_tensor(embedding)
 
         if self.return_label:
-            return keypoint, embedding, label
+            # print("retornando label ", label)
+            return keypoint, embedding, label_id
 
         return keypoint, embedding, None

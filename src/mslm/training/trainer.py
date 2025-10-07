@@ -9,9 +9,11 @@ import random
 torch.manual_seed(23)
 random.seed(23)
 
+from torch.optim.swa_utils import AveragedModel
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import LambdaLR
+from torch.nn import functional as F
 
 from src.mslm.utils.early_stopping import EarlyStopping
 from src.mslm.checkpoint.manager import CheckpointManager
@@ -22,12 +24,12 @@ from datetime import datetime
 
 def masked_mean_pool(x: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
     """
-    x:    [B, T, D]
-    mask: [B, T] con True = válido
+    x:        [B, T, D]
+    mask: [B, T] con True = PAD (ignorar)
     """
-    mask = mask.unsqueeze(-1).to(x.dtype)  # [B, T, 1]
-    num = (x * mask).sum(dim=dim)
-    den = mask.sum(dim=dim).clamp_min(1e-8)
+    valid = (~mask).unsqueeze(-1).to(x.dtype)   # 1.0 en válidos
+    num = (x * valid).sum(dim=dim)
+    den = valid.sum(dim=dim).clamp_min(1e-6)
     return num / den
 
 class Trainer:
@@ -74,14 +76,15 @@ class Trainer:
             )            
         else:
             self.criterion = ClipContrastiveLoss()
+        
 
         #Model
         self.model = model
         self.load_previous_model = kwargs.get("load_previous_model", False)
-                
-        #Dataloaders
-        self.train_loader = self.accelerator.prepare_data_loader(train_loader)
-        self.val_loader = self.accelerator.prepare_data_loader(val_loader)
+
+        #DataLoaders
+        self.train_loader = train_loader
+        self.val_loader = val_loader
 
         #Stopper
         self.early_stopping = EarlyStopping(patience=100)
@@ -113,6 +116,9 @@ class Trainer:
             self.model, self.criterion, self.optimizer, self.scheduler,
             self.train_loader, self.val_loader
         )
+
+        self.ema = AveragedModel(self.model, avg_fn=lambda ema, p, n: ema*0.999 + p*0.001)
+        
     @nvtx.annotate("Training Section", color="green")
     def train(self, prof = False):
         """Entrena el modelo Imitator.
@@ -124,7 +130,7 @@ class Trainer:
         self.optimizer = AdamW(
             [
                 {"params": self.model.parameters(), "weight_decay": self.weight_decay},
-                {"params": [self.criterion.logit_scale], "weight_decay": 0.0},
+                {"params": [self.criterion.logit_scale], "weight_decay": 0.0,},
             ],
             lr=self.learning_rate,
             foreach=True
@@ -137,7 +143,7 @@ class Trainer:
                 torch.tensor((current_step - warmup_steps) / (total_steps - warmup_steps) * 3.1415926535))
             ).item()
 
-        warmup_steps = 5 * len(self.train_loader)  # p.ej. 5 epochs de warm-up
+        warmup_steps = 2 * len(self.train_loader)  # p.ej. 10 epochs de warm-up
         total_steps = self.epochs * len(self.train_loader)
 
         lr_lambda = lambda step: linear_warmup_cosine_decay(step, warmup_steps, total_steps)
@@ -179,7 +185,7 @@ class Trainer:
             'temp': 0.0
         }
 
-        for keypoint, frames_padding_mask, embedding, mask_embedding in self.train_loader:
+        for keypoint, frames_padding_mask, embedding, mask_embedding, label in self.train_loader:
             # DEBUG
             if epoch == 0:
                 with torch.no_grad():
@@ -192,11 +198,13 @@ class Trainer:
                 self.graph_added = True           
             
             with self.accelerator.accumulate(self.model):
-                self.optimizer.zero_grad(set_to_none=True)        
-                train_loss, metrics = self._train_batch(keypoint, frames_padding_mask, embedding, mask_embedding)
+                # self.optimizer.zero_grad(set_to_none=True)
+                train_loss, metrics = self._train_batch(keypoint, frames_padding_mask, embedding, mask_embedding, label)
 
-                if self.scheduler is not None:
-                    self.scheduler.step()
+                if not hasattr(self, "_lrchk"):
+                    self.accelerator.print(f"[LR] {self.optimizer.param_groups[0]['lr']:.3e}")
+                    self._lrchk = True
+
 
                 total_loss += train_loss
                 for k, v in metrics.items():
@@ -219,14 +227,29 @@ class Trainer:
 
     def _forward_loss(self, keypoint, frames_padding_mask, embedding, mask_embedding):
         with self.accelerator.autocast():
-            output, pool_out = self.model(keypoint, frames_padding_mask)
-            mask_valid = ~mask_embedding.bool()   # True = válido
-            if (mask_valid.sum(dim=1) == 0).any():
-                # si alguna fila quedó sin válidos, se hace todo válido en esa fila
-                fix = (mask_valid.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
-                mask_valid[fix] = True
+            _, pool_out = self.model(keypoint, frames_padding_mask)
+
+            pool_out = F.normalize(torch.nan_to_num(pool_out), dim=-1)
+
+            if ((~mask_embedding.bool()).sum(dim=1) == 0).any():
+                idx = ((~mask_embedding.bool()).sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+                mask_embedding[idx, 0] = False
+                        
+            # DEBUG
+            if not hasattr(self, "_dbg_val_text"):
+                # conteo de tokens válidos (True=PAD → ~text_pad es válido)
+                tv = (~mask_embedding.bool()).sum(dim=1)
+                # stats del embedding crudo SOLO en posiciones válidas
+                m = ~mask_embedding.bool()
+                emb_valid = embedding[m]  # [N_valid, D]
+                self.accelerator.print(
+                    f"[VAL-DEBUG] text_valid/min={tv.min().item()} mean={tv.float().mean().item():.2f} | "
+                    f"emb_valid mean={emb_valid.float().mean().item():.4f} std={emb_valid.float().std().item():.4f}"
+                )
+                self._dbg_val_text = True
                 
-            text_emb = masked_mean_pool(embedding, mask_valid, dim=1)
+            text_emb = masked_mean_pool(embedding, mask_embedding, dim=1)
+            text_emb = F.normalize(torch.nan_to_num(text_emb), dim=-1)
             
             # DEBUG
             if not hasattr(self, "_dbg_done"):
@@ -238,7 +261,7 @@ class Trainer:
         return loss, metrics
 
     @nvtx.annotate("Train: Train Batch", color="green")
-    def _train_batch(self, keypoint, frames_padding_mask, embedding, mask_embedding):
+    def _train_batch(self, keypoint, frames_padding_mask, embedding, mask_embedding, label):
         self.optimizer.zero_grad(set_to_none=True)
 
         embs_v, embs_t = [], []
@@ -252,11 +275,18 @@ class Trainer:
             with self.accelerator.autocast():
                 _, v = self.model(keypoint[start:end], frames_padding_mask[start:end])
 
-                mask_valid = ~mask_embedding[start:end].bool()
-                if (mask_valid.sum(dim=1) == 0).any():
-                    fix = (mask_valid.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
-                    mask_valid[fix] = True
-                t = masked_mean_pool(embedding[start:end], mask_valid, dim=1)
+                t = masked_mean_pool(embedding[start:end], mask_embedding[start:end], dim=1)
+                pre_norm = t.norm(dim=1)
+                
+                # DEBUG
+                if not hasattr(self, "_val_t_once"):
+                    self.accelerator.print(f"[VAL-CHK] text_emb pre-norm: min={pre_norm.min().item():.4e} mean={pre_norm.mean().item():.4e}")
+                    self._val_t_once = True
+            v = torch.nan_to_num(v)
+            t = torch.nan_to_num(t)
+            
+            v = F.normalize(v, dim=-1)
+            t = F.normalize(t, dim=-1)
 
             embs_v.append(v)
             embs_t.append(t)
@@ -264,11 +294,36 @@ class Trainer:
         V = torch.cat(embs_v, dim=0)  # [B,D]
         T = torch.cat(embs_t, dim=0)  # [B,D]
 
-        loss, metrics = self.criterion(V, T)
+        if not hasattr(self, "_dbg_once"):
+            vf = (~frames_padding_mask.bool()).sum(dim=1)
+            vt = (~mask_embedding.bool()).sum(dim=1)
+            self.accelerator.print(f"[DEBUG] frames valid/min={vf.min().item()} mean={vf.float().mean().item():.2f} | "
+                                f"text valid/min={vt.min().item()} mean={vt.float().mean().item():.2f}")
+            self.accelerator.print(f"[DEBUG] ||v|| mean={V.norm(dim=1).mean().item():.3f} ||t|| mean={T.norm(dim=1).mean().item():.3f}")
+            self._dbg_once = True
+        
+        label_ids = torch.as_tensor(label, dtype=torch.long, device=V.device)
+        loss, metrics = self.criterion(V, T, labels=label_ids)
 
         self.accelerator.backward(loss)
+        if not hasattr(self, "_gradchk"):
+            with torch.no_grad():
+                g = 0.0
+                n = 0
+                for n_, p in self.model.named_parameters():
+                    if p.grad is not None:
+                        g += p.grad.data.pow(2).sum().item()
+                        n += 1
+                self.accelerator.print(f"[GRAD] params_with_grad={n} ||grad||={g**0.5:.3e} "
+                                    f"logit_scale_lr={self.optimizer.param_groups[1]['lr']:.2e} "
+                                    f"logit_scale={self.criterion.logit_scale.item():.3f}")
+            self._gradchk = True
+
+
         self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
         self.optimizer.step()
+        self.ema.update_parameters(self.model)
+
         if self.scheduler is not None:
             self.scheduler.step()  # por batch
 
@@ -287,8 +342,8 @@ class Trainer:
             'temp': 0.0
         }
 
-        for keypoint, frames_padding_mask, embedding, mask_embedding in self.val_loader:        
-            loss, metrics = self._val_batch(keypoint, frames_padding_mask, embedding, mask_embedding)
+        for keypoint, frames_padding_mask, embedding, mask_embedding, labels in self.val_loader:
+            loss, metrics = self._val_batch(keypoint, frames_padding_mask, embedding, mask_embedding, labels)
             val_loss += loss
             for k, v in metrics.items():
                 accumulated_metrics[k] += v
@@ -310,45 +365,78 @@ class Trainer:
         return final_val_loss
     
     @nvtx.annotate("Val: Validate Batch", color="green")
-    def _val_batch(self, keypoint, frames_padding_mask, embedding, mask_embedding) -> t.Tuple[torch.Tensor, dict]:
-        batch_loss = 0.0
-        accumulated_metrics = {
-            'acc_v2t': 0.0,
-            'acc_t2v': 0.0,
-            'temp': 0.0
-        }
-        
+    def _val_batch(self, keypoint, frames_padding_mask, embedding, mask_embedding, labels):
+        embs_v, embs_t = [], []
         batch_size = keypoint.size(0)
-        start = 0
-        end = keypoint.size(0)
-        
-        # Si batch_sampling es False, procesamos todo el batch de una vez
-        n_sub_batch = 1
-        if self.batch_sampling:
-            n_sub_batch = (batch_size + self.sub_batch - 1) // self.sub_batch
+        n_sub_batch = (batch_size + self.sub_batch - 1) // self.sub_batch if self.batch_sampling else 1
 
-        with nvtx.annotate("Val: Forward + Loss", color="blue"):
+        flag = True
+
+        with torch.no_grad():
             for i in range(n_sub_batch):
-                # Actualizar índices solo si estamos haciendo batch sampling
-                if self.batch_sampling:
-                    start = i * self.sub_batch
-                    end = min(start + self.sub_batch, batch_size)
-                
-                with nvtx.annotate("Forward Pass", color="blue"):
-                    with torch.no_grad():
-                        loss, metrics = self._forward_loss(keypoint[start:end], 
-                                                    frames_padding_mask[start:end], 
-                                                    embedding[start:end], 
-                                                    mask_embedding[start:end])
-                
-                # Normalizar pérdida y métricas si estamos haciendo batch sampling
-                if self.batch_sampling:
-                    loss /= n_sub_batch
-                    for k in metrics:
-                        metrics[k] /= n_sub_batch
-                        
-                batch_loss += loss.detach()
-                for k, v in metrics.items():
-                    accumulated_metrics[k] += v
+                s = i * self.sub_batch if self.batch_sampling else 0
+                e = min(s + self.sub_batch, batch_size) if self.batch_sampling else batch_size
 
-        return batch_loss, accumulated_metrics
+                # --- Modelo con PAD=True (coherente con forward del modelo)
+                # Garantiza ≥1 frame válido
+                pad_frames = frames_padding_mask[s:e].clone()
+                if ((~pad_frames).sum(dim=1) == 0).any():
+                    idx = ((~pad_frames).sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+                    pad_frames[idx, 0] = False
+                _, v = self.model(keypoint[s:e], pad_frames)
+
+                # --- Texto: PAD=True al pooling
+                pad_text = mask_embedding[s:e].clone()
+                if ((~pad_text).sum(dim=1) == 0).any():
+                    idx = ((~pad_text).sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+                    pad_text[idx, 0] = False
+                t = masked_mean_pool(embedding[s:e], pad_text, dim=1)
+
+                v = torch.nan_to_num(v); t = torch.nan_to_num(t)
+                v = F.normalize(v, dim=-1); t = F.normalize(t, dim=-1)
+
+                embs_v.append(v)
+                embs_t.append(t)
+
+            V = torch.cat(embs_v, dim=0)
+            T = torch.cat(embs_t, dim=0)
+
+            labels_ids = torch.as_tensor(labels, dtype=torch.long, device=V.device)
+            if flag:
+                with torch.no_grad():
+                    # supongamos que 'labels' es un vector [B] de IDs emparejados video↔texto
+                    # 1) ¿Los índices diagonales realmente son positivos?
+                    # (asumiendo DataLoader no baraja video y texto por separado)
+                    assert V.size(0) == T.size(0)
+                    # 2) diagnostiquemos “vecino más cercano comparte etiqueta”
+                    S = (V @ T.t()).float()  # [B,B]
+                    nn_t = S.argmax(dim=1)   # mejor texto para cada video
+                    nn_v = S.argmax(dim=0)   # mejor video para cada texto
+                    top1_v_shares_label = (labels_ids == labels_ids[nn_t]).float().mean().item()
+                    top1_t_shares_label = (labels_ids == labels_ids[nn_v]).float().mean().item()
+                    self.accelerator.print(f"[VAL-PAIR] share_label_v2t={top1_v_shares_label:.3f} share_label_t2v={top1_t_shares_label:.3f}")
+
+
+                with torch.no_grad():
+                    S = (V @ T.t()).float()
+                    B = S.size(0)
+                    diag = torch.diag(S)
+                    off = S[~torch.eye(B, dtype=torch.bool, device=S.device)]
+                    self.accelerator.print(
+                        f"[VAL-SIM] diag_mean={diag.mean():.3f} off_mean={off.mean():.3f} "
+                        f"diag_p10={diag.kthvalue(max(1, int(0.1*B))).values:.3f} "
+                        f"off_p90={off.kthvalue(max(1, int(0.9*off.numel()))).values:.3f}"
+                    )
+                    flag = False
+
+            if not hasattr(self, "_dbg_val_once"):
+                vf = (~frames_padding_mask.bool()).sum(dim=1)
+                vt = (~mask_embedding.bool()).sum(dim=1)
+                self.accelerator.print(f"[VAL-DEBUG] frames valid/min={vf.min().item()} mean={vf.float().mean().item():.2f} | "
+                                    f"text valid/min={vt.min().item()} mean={vt.float().mean().item():.2f}")
+                self.accelerator.print(f"[VAL-DEBUG] ||v|| mean={V.norm(dim=1).mean().item():.3f} ||t|| mean={T.norm(dim=1).mean().item():.3f}")
+                self._dbg_val_once = True
+
+            loss, metrics = self.criterion(V, T, labels_ids)
+
+        return loss.detach(), {k: (v.item() if torch.is_tensor(v) else float(v)) for k, v in metrics.items()}

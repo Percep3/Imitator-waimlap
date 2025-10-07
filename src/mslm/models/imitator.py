@@ -18,7 +18,7 @@ class Imitator(nn.Module):
         encoder_dropout: float = 0.4,
         cross_attention_dropout: float = 0.4,
         pool_dim: int = 256,
-        pool_strategy: t.Literal['cls', 'mean'] = 'cls'
+        pool_strategy: t.Literal['cls', 'mean'] = 'mean'
     ):
         super().__init__()
         
@@ -91,18 +91,26 @@ class Imitator(nn.Module):
             nn.Linear(output_size * 2, output_size)
         )
 
-    @torch.no_grad()
-    def _pool_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+    def _pool_tokens(self, tokens: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        # tokens: [B, T_eff, D], mask: [B, T_eff] con True=PAD (ignorar)
         if self.pool_strategy == 'mean':
-            v = tokens.mean(dim=1)
-        else: # para cls o por defecto
+            if mask is not None:
+                valid = (~mask).unsqueeze(-1).to(tokens.dtype)          # 1.0 en válidos
+                num = (tokens * valid).sum(dim=1)
+                den = valid.sum(dim=1).clamp_min(1e-6)
+                v = num / den
+            else:
+                v = tokens.mean(dim=1)
+        else:  # 'cls'
             v = tokens[:, 0, :]
-        return F.normalize(v, dim=-1)
+
+        return F.normalize(v, dim=-1)  # mantiene grad
     
     @torch.compile(dynamic=True)
     def forward(self, x:torch.Tensor, frames_padding_mask:torch.Tensor=None) -> t.Tuple[torch.Tensor, torch.Tensor]:
         """
         x: Tensor of frames
+        frames_padding_mask: Bool Tensor [B, T] (True = padding = ignorar)
         returns: Tensor of embeddings for each token (128 tokens of frames)
         """
 
@@ -129,29 +137,38 @@ class Imitator(nn.Module):
 
         x = self.linear_hidden(x)           # [B, pool_dim, hidden]
 
+        pad = None
+        if frames_padding_mask is not None:
+            pad = frames_padding_mask.bool()  # True = ignorar
+            # Garantiza al menos 1 válido por muestra
+            valid_counts = (~pad).sum(dim=1)
+            if (valid_counts == 0).any():
+                idx = (valid_counts == 0).nonzero(as_tuple=True)[0]
+                pad[idx, 0] = False
+            pad = pad.contiguous()
+
+        def enc(z):
+            return self.transformer(z, src_key_padding_mask=pad)
+
         if self.training:
-            x = checkpoint.checkpoint(
-                transformer_block, 
-                x,
-                use_reentrant=True
-            )                               # [B, pool_dim, hidden]
+            x = checkpoint.checkpoint(enc, x, use_reentrant=True)
         else:
-            x = self.transformer(x, src_key_padding_mask=frames_padding_mask)
+            x = enc(x)
 
         M = self.proj(x).contiguous()        # [B, pool_dim, output_size]
+        M = torch.nan_to_num(M)
         
-        Q = self.token_queries.unsqueeze(0).expand(B, -1, -1).contiguous()   # [B, n_tokens, output_size]
-        
-        if frames_padding_mask is not None:
-            frames_padding_mask = frames_padding_mask.contiguous()
+        T_eff = min(T, self.token_queries.shape[0])
+        Q = self.token_queries[:T_eff].unsqueeze(0).expand(B, -1, -1).contiguous()
+        M = M[:, :T_eff, :]
+        pad_eff = pad[:, :T_eff] if pad is not None else None
 
-        attn_out, attn_w = self.cross_attn(
-            query=Q,
-            key=M,
-            value=M,
-            key_padding_mask=frames_padding_mask
-        )  # [B, n_tokens, output_size]
+        attn_out, _ = self.cross_attn(query=Q, key=M, value=M, key_padding_mask=pad_eff) # [B, n_tokens, output_size]
+        attn_out = torch.nan_to_num(attn_out)
+        
         x = self.norm_attn(Q + attn_out)
         # print(f"Attention output shape: {attn_out.shape}, Q shape: {Q.shape}, M shape: {M.shape}")
         x = x + self.proj_final(attn_out)        # [B, n_tokens, output_size]
-        return x, self._pool_tokens(x)  # [B, n_tokens, output_size], [B, output_size]
+        x = torch.nan_to_num(x)
+        pooled = self._pool_tokens(x, mask=pad_eff) # [B, output_size]
+        return x, pooled  # [B, n_tokens, output_size], [B, output_size]
