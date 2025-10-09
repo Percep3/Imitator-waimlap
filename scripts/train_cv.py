@@ -57,7 +57,8 @@ def run(
         dataset=dataset,
         n_splits=n_folds,
         model_params=model_cfg,
-        training_params=training_cfg
+        training_params=training_cfg,
+        seed=23
     )
     
     # Print results

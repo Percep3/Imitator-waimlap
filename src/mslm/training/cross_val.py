@@ -2,8 +2,9 @@ import torch
 from torch.utils.data import Subset
 from ..utils.setup_train import create_dataloaders, build_model
 from .trainer import Trainer
+import gc
 
-def cross_validate(dataset, n_splits, model_params, training_params, seed=42):
+def cross_validate(dataset, n_splits, model_params, training_params, seed=23):
     """
     k-fold cross validation over a torch Dataset.
     - dataset: torch.utils.data.Dataset
@@ -53,6 +54,14 @@ def cross_validate(dataset, n_splits, model_params, training_params, seed=42):
         train_loss, val_loss = trainer.train()
 
         fold_metrics.append({'train_loss': train_loss, 'val_loss': val_loss})
+
+        torch._dynamo.reset()
+        try:
+            del model, trainer
+        except NameError:
+            pass
+        while gc.collect():
+            torch.cuda.empty_cache()
 
     avg_train_loss = sum(m['train_loss'] for m in fold_metrics) / n_splits
     avg_val_loss = sum(m['val_loss'] for m in fold_metrics) / n_splits
