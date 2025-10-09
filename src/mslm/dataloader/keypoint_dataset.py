@@ -93,8 +93,8 @@ class KeypointDataset(Dataset):
             self.original_videos = []
 
             for dataset in datasets:
-                #if dataset not in ["dataset1", "dataset3", "dataset5", "dataset7"]:
-                #    continue
+                if dataset not in ["dataset1", "dataset3", "dataset5", "dataset7"]:
+                    continue
 
                 clip_ids  = list(f[dataset]["embeddings"].keys())
 
