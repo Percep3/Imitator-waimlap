@@ -19,7 +19,7 @@ from torch.nn import functional as F
 from src.mslm.utils.early_stopping import EarlyStopping
 from src.mslm.checkpoint.manager import CheckpointManager
 # from src.mslm.training import imitator_loss
-from src.mslm.training.clip_loss import ClipContrastiveLoss
+from src.mslm.training import ClipContrastiveLoss, PadAwareTokenLoss, TokenSoftAlignLoss
 import nvtx
 from datetime import datetime
 
@@ -34,77 +34,119 @@ def masked_mean_pool(x: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Ten
     return num / den
 
 class Trainer:
-    def __init__(self, model, train_loader, val_loader, learning_rate, save_tb_model=True, **kwargs):
+    def __init__(self,
+                 model,
+                 train_loader,
+                 val_loader,
+                 learning_rate,
+                 save_tb_model=True,
+                 # === nuevos hiperparámetros ===
+                 lambda_tok=0.2,       # peso base del loss token-a-token
+                 tau_tok=5.0,          # temperatura del TokenSoftAlign
+                 lambda_pad=0.4,       # peso base del loss pad-aware
+                 compile_losses=True,
+                 **kwargs):
+        """
+        Entrenador Imitator con pérdidas: CLIP + TokenSoftAlign + PadAware.
+        """
+        from accelerate import Accelerator
+        from accelerate.utils import TorchDynamoPlugin
+        import torch
+
+        # -----------------------------
+        # Configuración básica
+        # -----------------------------
         dynamo_plugin = TorchDynamoPlugin(
-            backend="inductor",  # Options: "inductor", "aot_eager", "aot_nvfuser", etc.
-            mode="default",      # Options: "default", "reduce-overhead", "max-autotune"
+            backend="inductor",
+            mode="default",
             dynamic=True
         )
 
-        #Accelerator module
-        self.accelerator = Accelerator(mixed_precision="bf16", dynamo_plugin=dynamo_plugin)
+        self.accelerator = Accelerator(mixed_precision="bf16",
+                                       dynamo_plugin=dynamo_plugin)
         self.device = self.accelerator.device
-
-        #Hyperparameters
         self.epochs = kwargs.get("epochs", 100)
         self.learning_rate = learning_rate
-
-        #Loggers
         self.log_interval = kwargs.get("log_interval", 5)
         self.save_tb_model = save_tb_model
+        self.grad_clip = kwargs.get("grad_clip", 0.1)
+        self.weight_decay = kwargs.get("weight_decay", 0.05)
 
         version = kwargs.get("model_version", 1)
         checkpoint = kwargs.get("checkpoint", 1)
 
-        self.writer = SummaryWriter(f"../outputs/reports/{version}/{checkpoint}/{datetime.now().strftime('%d-%m-%Y-%H-%M-%S')}")
+        from torch.utils.tensorboard import SummaryWriter
+        from datetime import datetime
+        self.writer = SummaryWriter(
+            f"../outputs/reports/{version}/{checkpoint}/{datetime.now().strftime('%d-%m-%Y-%H-%M-%S')}"
+        )
         self.graph_added = False
-        
-        #Save and checkpoint
-        self.checkpoint_interval = kwargs.get("checkpoint_interval", 5)
+
+        from src.mslm.checkpoint.manager import CheckpointManager
         self.ckpt_mgr = CheckpointManager(
             kwargs.get("model_dir", "../outputs/checkpoints"),
             version,
             checkpoint,
         )
 
-        #Loss Function
-        if kwargs.get("compile", True):
-            self.criterion = torch.compile(
-                ClipContrastiveLoss(),
-                backend="inductor",
-                mode="default",
-                dynamic=True
-            )            
-        else:
-            self.criterion = ClipContrastiveLoss()
-        
+        from src.mslm.utils.early_stopping import EarlyStopping
+        self.early_stopping = EarlyStopping(patience=100)
 
-        #Model
         self.model = model
         self.load_previous_model = kwargs.get("load_previous_model", False)
-
-        #DataLoaders
         self.train_loader = train_loader
         self.val_loader = val_loader
 
-        #Stopper
-        self.early_stopping = EarlyStopping(patience=100)
+        self.lambda_tok = lambda_tok
+        self.lambda_pad = lambda_pad
+        self.tau_tok = tau_tok
 
-        #Optimizer
+        # CLIP global
+        self.criterion = ClipContrastiveLoss()
+
+        # Token-level alignment
+        self.tok_loss = TokenSoftAlignLoss(tau=self.tau_tok)
+
+        # Pad-aware frontier
+        self._pad_aux = PadAwareTokenLoss(
+            lambda_token=0.2,
+            lambda_pad=0.5,
+            lambda_mono=0.2,
+            lambda_boundary=0.2,
+            margin_push=0.2,
+            margin_boundary=0.3
+        )
+
+        # Opcionalmente compílalas si quieres optimización extra
+        if compile_losses:
+            self.criterion = torch.compile(self.criterion, backend="inductor", dynamic=True)
+            self.tok_loss = torch.compile(self.tok_loss, backend="inductor", dynamic=True)
+            self._pad_aux = torch.compile(self._pad_aux, backend="inductor", dynamic=True)
+
+        # -----------------------------
+        # Optimizador y scheduler (se crean en prepare_trainer)
+        # -----------------------------
         self.optimizer = None
         self.scheduler = None
 
-        #Batch Sampling
+        # batch splitting
         self.batch_size = kwargs.get("batch_size", 5)
         self.batch_sampling = kwargs.get("batch_sampling", True)
         if self.batch_sampling:
             self.sub_batch = kwargs.get("batch_sample", 4)
 
-        #Options 
+        self.checkpoint_interval = kwargs.get("checkpoint_interval", 5)
         self.prof = False
-        
-        self.grad_clip = kwargs.get("grad_clip", 0.1)
-        self.weight_decay = kwargs.get("weight_decay", 0.05)
+
+        # Rango de ramp-up para λ_tok y λ_pad (en pasos, no épocas)
+        self.lambda_tok_ramp = (0.3, 0.6)   # fracción de total_steps
+        self.lambda_pad_ramp = (0.6, 0.85)  # fracción de total_steps
+
+    @staticmethod
+    def _ramp(frac_start, frac_end, frac_now):
+        if frac_now <= frac_start: return 0.0
+        if frac_now >= frac_end:   return 1.0
+        return (frac_now - frac_start) / (frac_end - frac_start)
 
     def prepare_trainer(self):
         """Prepara todo lo necesario para el entrenamiento."""
@@ -146,6 +188,9 @@ class Trainer:
 
         warmup_steps = 2 * len(self.train_loader)  # p.ej. 10 epochs de warm-up
         total_steps = self.epochs * len(self.train_loader)
+        
+        self.total_steps  = total_steps
+        self.global_step  = 0
 
         lr_lambda = lambda step: linear_warmup_cosine_decay(step, warmup_steps, total_steps)
         self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
@@ -161,7 +206,7 @@ class Trainer:
         for epoch in tqdm(range(self.epochs), desc="Entrenando", colour="green"):
             train_loss = self._train_epoch(epoch)
             val_loss = self._val(epoch)
-
+            
             if epoch == 1:
                 self.ckpt_mgr.save_checkpoint(self.model, epoch, self.optimizer, self.scheduler)
             elif epoch == self.epochs - 1:
@@ -209,7 +254,7 @@ class Trainer:
 
                 total_loss += train_loss
                 for k, v in metrics.items():
-                    accumulated_metrics[k] += v
+                    accumulated_metrics[k] = accumulated_metrics.get(k, 0.0) + v
                 
         # Calculate averages
         final_train_loss = total_loss.item()/len(self.train_loader)
@@ -223,6 +268,11 @@ class Trainer:
         if epoch % self.log_interval == 0:
             metrics_str = " ".join([f"{k}: {v:.4f}" for k, v in avg_metrics.items()])
             tqdm.write(f"\nEpoch: {epoch}.\n Train loss: {final_train_loss:.4f} {metrics_str}")
+        
+        if "lam_tok_eff" in avg_metrics:
+            self.writer.add_scalar("Weights/lambda_tok_eff", avg_metrics["lam_tok_eff"], epoch)
+        if "lam_pad_eff" in avg_metrics:
+            self.writer.add_scalar("Weights/lambda_pad_eff", avg_metrics["lam_pad_eff"], epoch)
 
         return final_train_loss
 
@@ -266,6 +316,7 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         embs_v, embs_t = [], []
+        pred_tok_parts, text_tok_parts, mask_tok_parts = [], [], []
         batch_size = keypoint.size(0)
         n_sub_batch = (batch_size + self.sub_batch - 1) // self.sub_batch if self.batch_sampling else 1
 
@@ -274,15 +325,15 @@ class Trainer:
             end   = min(start + self.sub_batch, batch_size) if self.batch_sampling else batch_size
 
             with self.accelerator.autocast():
-                _, v = self.model(keypoint[start:end], frames_padding_mask[start:end])
+                X_tokens, v = self.model(keypoint[start:end], frames_padding_mask[start:end])
 
                 t = masked_mean_pool(embedding[start:end], mask_embedding[start:end], dim=1)
-                pre_norm = t.norm(dim=1)
                 
                 # DEBUG
                 if DEBUG and not hasattr(self, "_val_t_once"):
-                    self.accelerator.print(f"[VAL-CHK] text_emb pre-norm: min={pre_norm.min().item():.4e} mean={pre_norm.mean().item():.4e}")
+                    self.accelerator.print(f"[VAL-CHK] text_emb pre-norm: min={t.min().item():.4e} mean={t.mean().item():.4e}")
                     self._val_t_once = True
+                    
             v = torch.nan_to_num(v)
             t = torch.nan_to_num(t)
             
@@ -291,9 +342,16 @@ class Trainer:
 
             embs_v.append(v)
             embs_t.append(t)
+            
+            pred_tok_parts.append(torch.nan_to_num(X_tokens))
+            text_tok_parts.append(torch.nan_to_num(embedding[start:end]))   # texto por token
+            mask_tok_parts.append(mask_embedding[start:end])
 
         V = torch.cat(embs_v, dim=0)  # [B,D]
         T = torch.cat(embs_t, dim=0)  # [B,D]
+        P_tok = torch.cat(pred_tok_parts, dim=0)  # [B,T,D]
+        E_tok = torch.cat(text_tok_parts, dim=0).detach()   # detach ahorra memoria
+        M_tok = torch.cat(mask_tok_parts, dim=0)  # [B,T]
 
         if DEBUG and not hasattr(self, "_dbg_once"):
             vf = (~frames_padding_mask.bool()).sum(dim=1)
@@ -304,9 +362,19 @@ class Trainer:
             self._dbg_once = True
         
         label_ids = torch.as_tensor(label, dtype=torch.long, device=V.device)
-        loss, metrics = self.criterion(V, T, labels=label_ids)
+
+        loss_clip, m_clip = self.criterion(V, T, labels=label_ids)
+        loss_tok,  m_tok  = self.tok_loss(P_tok, E_tok, M_tok)
+        loss_pad,  m_pad  = self._pad_aux(P_tok, E_tok, M_tok)
+        
+        frac = float(self.global_step) / max(1, self.total_steps)
+        lam_tok_eff = self.lambda_tok * self._ramp(*self.lambda_tok_ramp, frac)
+        lam_pad_eff = self.lambda_pad * self._ramp(*self.lambda_pad_ramp, frac)
+
+        loss = loss_clip + lam_tok_eff * loss_tok + lam_pad_eff * loss_pad
 
         self.accelerator.backward(loss)
+        
         if DEBUG and not hasattr(self, "_gradchk"):
             with torch.no_grad():
                 g = 0.0
@@ -328,10 +396,23 @@ class Trainer:
         if self.scheduler is not None:
             self.scheduler.step()  # por batch
 
-        # logging
+        if self.accelerator.sync_gradients:
+            self.global_step += 1
+        
         batch_loss = loss.detach()
-        acc_metrics = {k: (v.item() if torch.is_tensor(v) else float(v)) for k, v in metrics.items()}
-        return batch_loss, acc_metrics
+        out_metrics = {
+            "loss_clip": loss_clip.detach().item(),
+            "loss_tok":  loss_tok.detach().item(),
+            "loss_pad":  loss_pad.detach().item(),
+            "lam_tok_eff": lam_tok_eff,
+            "lam_pad_eff": lam_pad_eff,
+        }
+        # mezcla con métricas existentes
+        out_metrics.update({k: (v.item() if torch.is_tensor(v) else float(v)) for k, v in m_clip.items()})
+        out_metrics.update({f"tok_{k}": (v.item() if torch.is_tensor(v) else float(v)) for k, v in m_tok.items()})
+        out_metrics.update({f"pad_{k}": (v.item() if torch.is_tensor(v) else float(v)) for k, v in m_pad.items()})
+
+        return batch_loss, out_metrics
 
     @nvtx.annotate("Validation Section", color="green")
     def _val(self, epoch):
