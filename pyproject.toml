@@ -21,6 +21,7 @@ dependencies = [
   "unsloth",
   "h5py",
   "nvtx",
+  "sacrebleu",
 ]
 
 [project.optional-dependencies]
@@ -60,4 +61,8 @@ env = { PYTHONPATH = "." }
 
 [tool.poe.tasks.worker]
 cmd = "python scripts/node_worker.py"
+env = { PYTHONPATH = "." }
+
+[tool.poe.tasks.bench]
+cmd = "python scripts/bench.py"
 env = { PYTHONPATH = "." }
