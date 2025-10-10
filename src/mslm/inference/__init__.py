@@ -1,2 +1,6 @@
 from .predictor import MultimodalSignLM
-from .predict_keypoint import KeyPointDetect
+
+try:
+    from .predict_keypoint import KeyPointDetect
+except ModuleNotFoundError:
+    KeyPointDetect = None
