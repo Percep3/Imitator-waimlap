@@ -55,12 +55,8 @@ env = { PYTHONPATH = "." }
 cmd = "python scripts/train_profile.py --epochs 4 --batch_size 4 --profile_mode pytorch_model"
 env = { PYTHONPATH = "." }
 
-[tool.poe.tasks.grpc_server]
-cmd = "python scripts/node_data.py --epochs 10 --batch_size 32"
-env = { PYTHONPATH = "." }
-
-[tool.poe.tasks.worker]
-cmd = "python scripts/node_worker.py"
+[tool.poe.tasks.cross_val]
+cmd = "python scripts/train_cv.py --epochs 70 --batch_size 64 --batch_sample 16 --n_folds 5"
 env = { PYTHONPATH = "." }
 
 [tool.poe.tasks.bench]

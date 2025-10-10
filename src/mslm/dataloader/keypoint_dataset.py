@@ -112,7 +112,7 @@ class KeypointDataset(Dataset):
             self.dataset_length = len(self.valid_index)
 
     def split_dataset(self, train_ratio):
-        train_dataset, validation_dataset = random_split(self, [train_ratio, 1 - train_ratio], generator=torch.Generator().manual_seed(42))
+        train_dataset, validation_dataset = random_split(self, [train_ratio, 1 - train_ratio], generator=torch.Generator().manual_seed(23))
         val_length = [self.video_lengths[i] for i in validation_dataset.indices] 
         
         if self.data_augmentation:
