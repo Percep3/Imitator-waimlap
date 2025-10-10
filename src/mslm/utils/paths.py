@@ -46,6 +46,7 @@ class PathVariables:
         self.data_path = dp
         #self.h5_file = dp / dataset_filename
         self.h5_file = "/run/media/giorgio6846/DataModels/processed_oldver/dataset_v9.hdf5"
+        #self.h5_file = "/run/media/giorgio6846/DataModels/processed_oldver/dataset_val.hdf5"
         self.A_matrix = dp / 'adjacency_matrix.npy'
 
 path_vars = PathVariables(dataset_filename="dataset_v6_unsloth.hdf5")

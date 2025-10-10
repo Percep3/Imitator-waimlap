@@ -21,6 +21,7 @@ dependencies = [
   "unsloth",
   "h5py",
   "nvtx",
+  "sacrebleu",
 ]
 
 [project.optional-dependencies]
@@ -56,4 +57,8 @@ env = { PYTHONPATH = "." }
 
 [tool.poe.tasks.cross_val]
 cmd = "python scripts/train_cv.py --epochs 70 --batch_size 64 --batch_sample 16 --n_folds 5"
+env = { PYTHONPATH = "." }
+
+[tool.poe.tasks.bench]
+cmd = "python scripts/bench.py"
 env = { PYTHONPATH = "." }

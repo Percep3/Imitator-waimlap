@@ -14,6 +14,7 @@ outputs/
 *.db
 *.log
 dt*
+*.h5
 
 nk_*
 *.pickle
