@@ -19,7 +19,9 @@ from torch.nn import functional as F
 from src.mslm.utils.early_stopping import EarlyStopping
 from src.mslm.checkpoint.manager import CheckpointManager
 # from src.mslm.training import imitator_loss
-from src.mslm.training import ClipContrastiveLoss, PadAwareTokenLoss, TokenSoftAlignLoss
+from src.mslm.training.clip_loss import ClipContrastiveLoss
+from src.mslm.training.padaware_loss import PadAwareTokenLoss
+from src.mslm.training.softtoken_loss import TokenSoftAlignLoss
 import nvtx
 from datetime import datetime
 

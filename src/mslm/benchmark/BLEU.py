@@ -395,7 +395,7 @@ def exec_bleu(true:list[list], pred:list[str]):
     return bleu.score
 
 def load_config():
-    _, _, h5_file = setup_paths()
+    _,_, h5_file = setup_paths()
         
     training_cfg:dict = cfg.training
     model_cfg = cfg.model
@@ -470,6 +470,112 @@ def embeddings_to_text(embeddings: torch.Tensor, all_embeddings: torch.Tensor, t
     #print(f"Token IDs: {token_ids}")
     return tokenizer.decode(token_ids, skip_special_tokens=True)
 
+
+def _is_space_token(tok: str) -> bool:
+    # En tokenizers tipo SentencePiece, '▁' marca inicio de palabra
+    return tok.startswith("▁") or tok.startswith("<bos>")
+
+@torch.no_grad()
+def embeddings_to_text_viterbi(
+    embeddings: torch.Tensor,        # [L, D] (viene de tu modelo o del HDF5)
+    all_embeddings: torch.Tensor,    # [V, D] (tabla del LLM)
+    tokenizer,
+    topk: int = 24,
+    tau: float = 0.30,
+    rep_penalty: float = 0.65,
+    nospace_run_penalty: float = 0.10,
+    start_space_bonus: float = 0.35,
+):
+    # Unificar device y dtype
+    device = all_embeddings.device
+    dtype  = all_embeddings.dtype
+
+    # eps evita NaNs si llega un vector ~cero
+    X = F.normalize(embeddings.to(device=device, dtype=dtype), p=2, dim=1, eps=1e-6)  # [L, D]
+    E = F.normalize(all_embeddings.to(device=device, dtype=dtype), p=2, dim=1, eps=1e-6)  # [V, D]
+
+    S = torch.matmul(X, E.T)  # [L, V]  <-- ya no crashea
+    topv, topi = torch.topk(S, k=min(topk, S.size(1)), dim=1)
+
+    special = set(tokenizer.all_special_ids)
+    tok_str = tokenizer.convert_ids_to_tokens(torch.arange(E.size(0), device=device).tolist())
+
+    # DP/Viterbi (igual que te pasé antes) ...
+    # --- inicialización ---
+    dp   = torch.full((topv.size(0), topv.size(1)), -1e9, device=device)
+    prev = torch.full_like(dp, -1, dtype=torch.long)
+
+    def is_space(tok: str) -> bool:
+        return tok.startswith("▁")
+
+    # t=0
+    for j in range(topv.size(1)):
+        vid = int(topi[0, j].item())
+        if vid in special: 
+            continue
+        sc = float(topv[0, j].item())
+        if sc < tau:
+            continue
+        if is_space(tok_str[vid]): 
+            sc += start_space_bonus
+        dp[0, j] = sc
+
+    # transiciones
+    for t in range(1, topv.size(0)):
+        for j in range(topv.size(1)):
+            vj = int(topi[t, j].item())
+            if vj in special:
+                continue
+            base = float(topv[t, j].item())
+            if base < tau:
+                continue
+            cur_space = is_space(tok_str[vj])
+
+            best_val = -1e9
+            best_k   = -1
+            for k in range(topv.size(1)):
+                prev_val = float(dp[t-1, k].item())
+                if prev_val <= -1e8:
+                    continue
+                vi = int(topi[t-1, k].item())
+                val = prev_val + base
+                if vi == vj:
+                    val -= rep_penalty
+                prev_space = is_space(tok_str[vi])
+                if not prev_space and not cur_space:
+                    val -= nospace_run_penalty
+                if val > best_val:
+                    best_val = val
+                    best_k   = k
+            dp[t, j]   = best_val
+            prev[t, j] = best_k
+
+    # backtrack
+    last_t = topv.size(0) - 1
+    j = int(torch.argmax(dp[last_t]).item())
+    if dp[last_t, j].item() <= -1e8:
+        return ""
+
+    ids = []
+    for t in range(last_t, -1, -1):
+        ids.append(int(topi[t, j].item()))
+        j = int(prev[t, j].item())
+        if t > 0 and j < 0:
+            break
+    ids.reverse()
+
+    # limpieza
+    ids2 = []
+    for vid in ids:
+        if vid in special:
+            continue
+        if not ids2 or ids2[-1] != vid:
+            ids2.append(vid)
+
+    pieces = tokenizer.convert_ids_to_tokens(ids2)
+    text = ''.join(p.replace('▁', ' ') for p in pieces).strip()
+    return text
+
 def main(version:str, checkpoint:str, epoch:int):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -537,7 +643,7 @@ def main(version:str, checkpoint:str, epoch:int):
                     seq_len = min(pred_embeds.size(1), valid_tokens)
                     pred_embeds = pred_embeds[0, :seq_len, :].contiguous()
 
-                    embed_array = pred_embeds.detach().cpu().numpy()
+                    embed_array = pred_embeds.detach().cpu().numpy().astype("float32")
                     
                     res = {
                         "label": label_text,
@@ -564,7 +670,9 @@ def main(version:str, checkpoint:str, epoch:int):
     pred_list_bench = []
     for res in results:
         embed_pred = torch.from_numpy(res["embed_pred"])
-        pred_text = embeddings_to_text(embed_pred, all_embeddings, tokenizer)
+        embed_pred = embed_pred.to(device=all_embeddings.device, dtype=all_embeddings.dtype)
+
+        pred_text = embeddings_to_text_viterbi(embed_pred, all_embeddings, tokenizer)
         print(pred_text)
         
         pred_list_bench.append(pred_text)
