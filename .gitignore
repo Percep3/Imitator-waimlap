@@ -1,0 +1,31 @@
+#Python cache
+__pycache__
+
+#Unsloth data
+**/unsloth_compiled_cache/
+
+#Dataset and model data
+data/
+outputs/
+
+#Model profiling and debugging
+*.qdstrn
+*.nsys-rep
+*.db
+*.log
+dt*
+*.h5
+
+nk_*
+*.pickle
+**/test_code*
+dt*
+
+# macOS system files
+*.DS_Store
+
+#PIP Packages
+pip-packages
+
+#Compiler Dependencies
+**/deps

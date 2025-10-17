@@ -1,0 +1,13 @@
+[training]
+learning_rate = 6e-05
+model_version = 121
+checkpoint = 1
+epochs = 10
+log_interval = 1
+checkpoint_interval = 5
+batch_size = 32
+batch_sample = 4
+train_ratio = 0.8
+device = "auto"
+weight_decay = 0.05
+grad_clip = 1.3
